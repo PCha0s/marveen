@@ -276,6 +276,15 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
     requiresRestart: true,
   },
   {
+    key: 'FLEET_PYTHON_VENV',
+    type: 'string',
+    default: '~/.klaudia-venv',
+    description: 'A flotta közös Python venv mappája. Ha a <mappa>/bin létezik, minden ügynök indítási PATH-jának elejére kerül, így a skillek sima python3 hívása és a venv CLI-jei (markitdown stb.) a venv-ből jönnek. Nem létező mappa = kikapcsolva. Kezdő ~ = home.',
+    module: 'system',
+    secret: false,
+    requiresRestart: true,
+  },
+  {
     key: 'OLLAMA_URL',
     type: 'string',
     default: 'http://localhost:11434',
