@@ -61,7 +61,24 @@ import { getProvider, getProviderType, channelStateDir, readChannelToken, type C
 import { decideContinueFlag, verifyContinueLaunch } from './channel-continue-policy.js'
 import { measureClaudeCliVersion } from './claude-cli-version.js'
 import { getClaudePidForSession, probeChannelPluginLiveness } from '../channel-coordinator/liveness.js'
-import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT, SUBAGENT_INBOX_TEE } from '../config.js'
+import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT, SUBAGENT_INBOX_TEE, FLEET_PYTHON_VENV } from '../config.js'
+
+// FLEETVENV923: the `<venv>/bin:` prefix for a launch PATH, or '' when the venv
+// has no bin/ directory or its path cannot sit safely inside the double-quoted
+// `export PATH="..."` of the launch command (a `"`, `$` or backtick in the
+// path would be re-interpreted by the shell -- skipped rather than escaped,
+// with a warning, because a fleet venv at such a path is a config mistake).
+// Exported for unit tests; `exists` is the seam.
+export function fleetVenvPathPrefix(venvDir: string = FLEET_PYTHON_VENV, exists: (p: string) => boolean = existsSync): string {
+  if (!venvDir) return ''
+  const bin = join(venvDir, 'bin')
+  if (!exists(bin)) return ''
+  if (/["$`\\]/.test(bin)) {
+    logger.warn({ venvDir }, 'fleetVenvPathPrefix: venv path contains a shell-active character; PATH prefix skipped')
+    return ''
+  }
+  return `${bin}:`
+}
 import { getEffectiveSettingValue } from '../settings-store.js'
 import { filterInheritableMcpServers, readInheritableMcpServerNames, logNotInherited } from './mcp-inheritance.js'
 import { readEnvFile } from '../env.js'
@@ -2476,7 +2493,10 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     // A `${byoUnsetEnv}` a SZERZO tagja (BYO/custom agensnel az orokolt OAuth-tokent le kell
     // venni, kulonben a CLI azt preferalja a sajat kulcs helyett). A bazis azota fuggvennye tette
     // ezt a sort az EPERM-fallback miatt; a tag ugyanabba a poziciba kerult vissza.
-    const buildLaunchCmd = (launchCwd: string) => `${umaskPrefix}export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${autoUpdaterEnv}${byoUnsetEnv}${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${providerEnv}cd "${launchCwd}" && ${claudeBin()} ${continueFlag}${skipFlag}--model ${shSingleQuote(model)} ${channelFlag}${worksourceFlags}`.trimEnd()
+    // FLEETVENV923: the fleet venv's bin/ goes FIRST so its python3 beats the
+    // Homebrew one that carries no packages.
+    const venvPathPrefix = fleetVenvPathPrefix()
+    const buildLaunchCmd = (launchCwd: string) => `${umaskPrefix}export PATH="${venvPathPrefix}/opt/homebrew/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:/bin:$PATH" && ${unsetTokens} && ${autoUpdaterEnv}${byoUnsetEnv}${promptSuggestionEnv}${mcpEnv}${channelSetup}${apiKeyEnv}${claudeConfigEnv}${oauthTokenEnv}${providerEnv}cd "${launchCwd}" && ${claudeBin()} ${continueFlag}${skipFlag}--model ${shSingleQuote(model)} ${channelFlag}${worksourceFlags}`.trimEnd()
     // The agent's own target: for a per-user agent this is what makes the whole
     // session (and every process inside it) belong to that uid. Passing null here
     // silently started it as the router's user -- measured 2026-08-19: the start
