@@ -1,0 +1,40 @@
+# requirements-fleet.txt - Python packages the Klaudia fleet's skills and scripts import.
+# Draft 2026-09-23 (Kígyó), from the Mac mini tool inventory
+# (agents/kigyo/reviews/mini-eszkoz-leltar-2026-09-23.md). Versions pinned from the
+# Mac mini install of 2026-09-23 (`~/.klaudia-venv/bin/pip freeze`, Python 3.14.7).
+#
+# Install (Homebrew python3, 3.14.x on the mini). Prefer a venv so the brew
+# interpreter stays clean:
+#   python3 -m venv ~/.klaudia-venv && ~/.klaudia-venv/bin/pip install -r requirements-fleet.txt
+# or, user site: python3 -m pip install --user -r requirements-fleet.txt
+#
+# Not pip, but needed by the same skills (see the inventory):
+#   brew install --cask libreoffice   # document-skills xlsx recalc.py, docx/pptx pdf-convert
+#   brew install pandoc               # document-skills docx read
+#   npm install -g docx pptxgenjs     # document-skills docx/pptx generators
+#   npm install -g @openai/codex      # codex-task.sh, astra_chat.py (login: CODEX_HOME=~/.codex-cli codex login)
+
+# --- xlsx / data (cella: xlsx read+write, formatting; konnektor: post-write load check;
+#     kigyo: agents/kigyo/scripts/akc_report.py; document-skills xlsx)
+pandas==3.0.6
+numpy==2.5.3
+openpyxl==3.1.5
+xlsxwriter==3.2.9
+xlrd==2.0.2          # legacy .xls sources
+pyxlsb==1.0.10        # .xlsb sources
+
+# --- PDF (akc-report generate_pdf.py, document-skills pdf)
+reportlab==5.0.1
+pypdf==6.19.0
+pdfplumber==0.11.10
+
+# --- document-skills (Anthropic anthropic-agent-skills: xlsx/docx/pptx/pdf scripts)
+markitdown==0.1.8    # quick look at xlsx/pptx, expected preinstalled by the skills
+defusedxml==0.7.1
+lxml==6.1.3
+Pillow==12.3.0
+
+# --- optional -------------------------------------------------------------
+# playwright    # webapp-testing skill; then: playwright install chromium
+# fonttools     # only for woff2 -> ttf conversion (akc-report fonts, rare)
+# brotli        # companion of fonttools for woff2
