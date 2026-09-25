@@ -32,8 +32,9 @@ import {
 } from '../pane-state.js'
 import { scheduleRecoveryBrief } from './restart-recovery-brief.js'
 import { beginRestart, endRestart } from './restart-lock.js'
-import { agentDir, listAgentNames, readAgentModel, resolveAgentModelDetailed, readAgentClaudeConfigDir, readAgentClaudePlan, readAgentChannelProvider, readAgentAuthMode, readAgentDisplayName, readAgentRemoteConfig, readAgentRemoteHost, readAgentRunAsUser, readAgentMemoryIsolation, readAgentWorksourceChannel, readAgentCustomProvider } from './agent-config.js'
+import { agentDir, listAgentNames, readAgentModel, resolveAgentModelDetailed, readAgentClaudeConfigDir, readAgentClaudePlan, readAgentChannelProvider, readAgentAuthMode, readAgentDisplayName, readAgentRemoteConfig, readAgentRemoteHost, readAgentRunAsUser, readAgentMemoryIsolation, readAgentWorksourceChannel, readAgentCustomProvider, readFileOr } from './agent-config.js'
 import { loadCustomProvider, type CustomProviderDef } from './custom-providers.js'
+import { decideOwnOauthToken, ownOauthTokenExport, ownOauthLaunchVerdict } from './agent-oauth-token-file.js'
 import { worksourceRootFor } from './worksource-queue.js'
 import { resolveAgentConfigDir, readClaudePlans, getClaudePlan } from './claude-plans.js'
 import { readClaudePlansState } from './claude-plans-state.js'
@@ -1761,6 +1762,36 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
   // Remote agents are handled entirely by the ssh path above (with its own
   // start guard), before any local already-running check / scaffolding.
   const remote = readAgentRemoteConfig(name)
+
+  // Per-agent setup-token file (agent-config.json "oauthTokenFile", 2fb86ef2).
+  // Decided before ANY launch step, remote agents included: a present but
+  // unusable field refuses the start, loudly, and never falls back to the fleet
+  // token (see agent-oauth-token-file.ts). Absent field -> 'unset' -> every
+  // branch below runs exactly as before.
+  const ownOauth = decideOwnOauthToken({
+    rawConfigJson: readFileOr(join(dir, 'agent-config.json'), '{}'),
+    isMainAgent: name === MAIN_AGENT_ID,
+    isRemote: !!(remote.host && remote.workdir),
+    // The launcher's own discriminators (see isCustom / isClaude below): a set
+    // customProvider wins over every model pattern, and for the rest the
+    // resolved model must start with claude-.
+    isCustomProvider: readAgentCustomProvider(name) !== null,
+    isClaudeModel: resolveOpenRouterModel(readAgentModel(name)).startsWith('claude-'),
+    authMode: readAgentAuthMode(name),
+    hasExplicitConfigDir: readAgentClaudeConfigDir(name) !== null,
+    hasClaudePlan: !!readAgentClaudePlan(name),
+    fleetTokenPath: FLEET_OAUTH_TOKEN_PATH,
+    uid: typeof process.getuid === 'function' ? process.getuid() : null,
+  })
+  if (ownOauth.kind === 'refused') {
+    logger.error(
+      { name, path: ownOauth.path, reason: ownOauth.reason, detail: ownOauth.detail },
+      'oauthTokenFile: agent NOT started (fail-closed, no fallback to the fleet token)',
+    )
+    return { ok: false, error: `oauthTokenFile: ${ownOauth.reason}${ownOauth.detail ? ` (${ownOauth.detail})` : ''}` }
+  }
+  const ownTokenFile = ownOauth.kind === 'ok' ? ownOauth.path : null
+
   if (remote.host && remote.workdir) {
     return startRemoteAgentProcess(name, remote.host, remote.workdir, opts)
   }
@@ -1880,6 +1911,17 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     const model = isCustom ? rawModel : resolveOpenRouterModel(rawModel)
     const authMode = readAgentAuthMode(name)
     const isClaude = !isCustom && model.startsWith('claude-')
+    // 2fb86ef2 backstop: the decision above already refused a custom-provider or
+    // non-Claude agent with its own token. Re-checked on the launcher's own
+    // isClaude, so a drift between the two predicates refuses instead of
+    // launching with a setup-token that no export site will use.
+    if (ownTokenFile && !isClaude) {
+      logger.error(
+        { name, path: ownTokenFile, customProviderId, model },
+        'oauthTokenFile: agent is not a Claude OAuth agent -- NOT started (a setup-token cannot take effect here)',
+      )
+      return { ok: false, error: 'oauthTokenFile: not a Claude OAuth agent' }
+    }
     // When authHeader=x-api-key, the CLI's ANTHROPIC_API_KEY approval prompt
     // cannot be answered in --channels mode. Pre-seed the approval into
     // .claude.json (see stampCustomApiKeyApproval) after claudeConfigDir is
@@ -2175,7 +2217,10 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     // stable token instead -- this is what makes the Linux credentials-guard
     // rename safe (a shared sub-agent with no env token would otherwise be
     // locked out once credentials.json is moved aside). No-op without a token.
-    if (!claudeConfigDir && hasFleetOauthToken() && needsFleetOauth) {
+    if (ownTokenFile) {
+      // 2fb86ef2: the agent's own setup-token file, INSTEAD of the fleet file.
+      oauthTokenEnv = ownOauthTokenExport(ownTokenFile)
+    } else if (!claudeConfigDir && hasFleetOauthToken() && needsFleetOauth) {
       oauthTokenEnv = `export CLAUDE_CODE_OAUTH_TOKEN="$(cat '${FLEET_OAUTH_TOKEN_PATH}')" && `
     }
     // Isolation must also cover CHANNEL-LESS Claude-OAuth agents, not just
@@ -2215,6 +2260,14 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
           logger.warn({ name }, 'own_team auth: isolated config dir provisioning failed; agent falls back to the shared ~/.claude and will use the HOST credential, not its own Team login')
           if (hasChannel) maybeAlertSharedConfigCollision(name)
         }
+      } else if (ownTokenFile) {
+        // 2fb86ef2: isolated exactly like the fleet branch below; only the token
+        // source differs, so the fleet token's presence is irrelevant here.
+        const isolated = ensureIsolatedChannelConfigDir(name, hasChannel ? agentProvider : null)
+        if (isolated) {
+          claudeConfigDir = isolated
+          oauthTokenEnv = ownOauthTokenExport(ownTokenFile)
+        }
       } else if (hasFleetOauthToken()) {
         // Token present -> isolation works; any earlier degradation is resolved,
         // so re-arm the one-shot alert for a future token loss.
@@ -2241,6 +2294,34 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
         // only get the WARN.
         if (hasChannel) maybeAlertSharedConfigCollision(name)
       }
+    }
+    // 2fb86ef2: a Claude agent with its own token must run isolated. On the
+    // shared ~/.claude the rotating host credential wins over the env token, so
+    // the agent would silently authenticate as the host, not with its own token.
+    if (ownTokenFile && isClaude && !claudeConfigDir) {
+      logger.error(
+        { name, path: ownTokenFile },
+        'oauthTokenFile: isolated config dir could not be provisioned -- agent NOT started (the shared ~/.claude would authenticate it with the host credential)',
+      )
+      return { ok: false, error: 'oauthTokenFile: isolated config dir could not be provisioned' }
+    }
+    // 2fb86ef2: the claim is derived from the launch env itself, not from the
+    // decision. One verdict drives both the refusal and the log: an 'ok'
+    // decision that did not reach oauthTokenEnv would run the agent on the
+    // fleet token (or none) while the log said otherwise, so it refuses.
+    const ownLaunch = ownOauthLaunchVerdict(ownOauth, oauthTokenEnv)
+    if (ownLaunch.kind === 'refuse') {
+      logger.error(
+        { name, path: ownLaunch.path },
+        'oauthTokenFile: own token decided but NOT in the launch env -- agent NOT started (no fallback to the fleet token)',
+      )
+      return { ok: false, error: 'oauthTokenFile: own token did not reach the launch env' }
+    }
+    if (ownLaunch.kind === 'own') {
+      logger.info(
+        { name, path: ownLaunch.path, fingerprint: ownLaunch.fingerprint },
+        'oauthTokenFile: own setup-token exported instead of the fleet token',
+      )
     }
     // Per-project trust pre-seed in the config root this session will ACTUALLY
     // use (isolated CLAUDE_CONFIG_DIR when set, shared ~/.claude.json
