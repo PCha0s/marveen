@@ -39,7 +39,7 @@ const EXPECTED: Record<string, string[]> = {
     'ledger-capture.py', 'inbox-drain.py', 'telegram-reply-directive.py',
     'provenance-gate.py', 'staleness-guard.py', 'memory-lookup-nudge.py', 'channel-inbox-drain.py',
     'voice-reply-directive.py', 'telegram_progress.py', 'slack_progress.py',
-    'claude-usage.py',
+    'marveen-commands.py',
   ],
   PostToolUse: [
     'ledger-outbound.py', 'tool-log-capture.py',
