@@ -278,8 +278,8 @@ export const SETTINGS_REGISTRY: SettingDefinition[] = [
   {
     key: 'FLEET_PYTHON_VENV',
     type: 'string',
-    default: '~/.klaudia-venv',
-    description: 'A flotta közös Python venv mappája. Ha a <mappa>/bin létezik, minden ügynök indítási PATH-jának elejére kerül, így a skillek sima python3 hívása és a venv CLI-jei (markitdown stb.) a venv-ből jönnek. Nem létező mappa = kikapcsolva. Kezdő ~ = home.',
+    default: '',
+    description: 'Opcionális közös Python venv a flottának. Ha meg van adva és a <mappa>/bin/python3 létezik, egy csak python3/pip-et tartalmazó shim mappa (store/python-shim) kerül minden ügynök indítási PATH-jának elejére, így a skillek sima python3 hívása a venv-ből jön, a rendszer-eszközöket (git, gh, node) viszont nem árnyékolja. Üres = kikapcsolva. Kezdő ~ = home.',
     module: 'system',
     secret: false,
     requiresRestart: true,

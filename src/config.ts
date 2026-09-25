@@ -342,7 +342,8 @@ export const AGENT_API_ORIGIN = cfg('AGENT_API_ORIGIN') ?? ''
 // packages, so every skill `python3` call import-failed while a venv with the
 // packages sat next to it. A `~` prefix means the home directory; a
 // nonexistent directory (or an empty string) disables the prefix.
-const _fleetVenvRaw = cfg('FLEET_PYTHON_VENV') ?? '~/.klaudia-venv'
+// FLEETVENV923: opt-in; empty (the default) = off. Quotes are already stripped by cfg()/readEnvFile.
+const _fleetVenvRaw = (cfg('FLEET_PYTHON_VENV') ?? '').trim()
 export const FLEET_PYTHON_VENV = _fleetVenvRaw.startsWith('~') ? join(homedir(), _fleetVenvRaw.slice(1)) : _fleetVenvRaw
 // Extra browser origins allowed to make state-changing dashboard requests
 // (CORS + CSRF allowlist), comma-separated, e.g. for VPN/LAN addresses that

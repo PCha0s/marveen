@@ -513,19 +513,14 @@ unset TMUX
 
 export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
-# FLEETVENV923: the fleet Python venv's bin/ goes FIRST, when it exists, so the
-# main session's `python3` (and markitdown & co.) come from the venv -- parity
-# with startAgentProcess (sub-agents) and the channel-monitor recovery relaunch.
-# Read from .env the same way as MAIN_AGENT_ID above (no `set -a`); a leading
-# `~` means $HOME; a missing directory disables the prefix.
-FLEET_PYTHON_VENV=""
-if [ -f "$INSTALL_DIR/.env" ]; then
-  FLEET_PYTHON_VENV="$(grep -E '^FLEET_PYTHON_VENV=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
-fi
-FLEET_PYTHON_VENV="${FLEET_PYTHON_VENV:-~/.klaudia-venv}"
-case "$FLEET_PYTHON_VENV" in "~"*) FLEET_PYTHON_VENV="$HOME${FLEET_PYTHON_VENV#\~}" ;; esac
-if [ -d "$FLEET_PYTHON_VENV/bin" ]; then
-  export PATH="$FLEET_PYTHON_VENV/bin:$PATH"
+# FLEETVENV923: opt-in fleet Python venv (FLEET_PYTHON_VENV in .env): a shim
+# with only python3/pip goes FIRST, so the main session's `python3` comes from
+# the venv while system tools keep winning -- parity with startAgentProcess,
+# the channel-monitor relaunch, background claude -p and watchdog.sh. The
+# script reads .env itself (one key, no `set -a`) and prints nothing when off.
+PYTHON_SHIM_PREFIX="$(bash "$INSTALL_DIR/scripts/python-shim-prefix.sh" "$INSTALL_DIR" 2>/dev/null || true)"
+if [ -n "$PYTHON_SHIM_PREFIX" ]; then
+  export PATH="${PYTHON_SHIM_PREFIX}$PATH"
 fi
 
 # Root VPS / container: Claude Code refuses --dangerously-skip-permissions when

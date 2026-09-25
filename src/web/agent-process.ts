@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatSync, symlinkSync, rmSync, realpathSync, renameSync, statSync, chmodSync, mkdtempSync, unlinkSync } from 'node:fs'
+import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync, lstatSync, symlinkSync, rmSync, realpathSync, renameSync, statSync, chmodSync, mkdtempSync, unlinkSync, readlinkSync } from 'node:fs'
 import { encodeClaudeProjectDir } from '../claude-project-dir.js'
 import { join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
@@ -63,21 +63,67 @@ import { measureClaudeCliVersion } from './claude-cli-version.js'
 import { getClaudePidForSession, probeChannelPluginLiveness } from '../channel-coordinator/liveness.js'
 import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT, SUBAGENT_INBOX_TEE, FLEET_PYTHON_VENV } from '../config.js'
 
-// FLEETVENV923: the `<venv>/bin:` prefix for a launch PATH, or '' when the venv
-// has no bin/ directory or its path cannot sit safely inside the double-quoted
-// `export PATH="..."` of the launch command (a `"`, `$` or backtick in the
-// path would be re-interpreted by the shell -- skipped rather than escaped,
-// with a warning, because a fleet venv at such a path is a config mistake).
-// Exported for unit tests; `exists` is the seam.
-export function fleetVenvPathPrefix(venvDir: string = FLEET_PYTHON_VENV, exists: (p: string) => boolean = existsSync): string {
+// FLEETVENV923: the `<store>/python-shim:` prefix for a launch PATH, or '' when
+// the opt-in fleet venv is unset, has no bin/python3, or the shim path cannot
+// sit safely inside the double-quoted `export PATH="..."` of the launch command
+// (a `"`, `$`, backtick or backslash would be re-interpreted by the shell --
+// skipped with a warning rather than escaped, because such a path is a config
+// mistake). The shim exposes ONLY python3/python/pip/pip3 as symlinks into the
+// venv (reviewer request on #1504): prepending the whole bin/ would let any pip
+// console-script shadow a system tool for every agent. A venv CLI such as
+// markitdown stays reachable as `python3 -m markitdown`.
+// Pure part exported for unit tests; `fs` is the seam.
+export const PYTHON_SHIM_TOOLS = ['python3', 'python', 'pip', 'pip3'] as const
+
+export function fleetPythonShimPrefix(
+  venvDir: string,
+  shimDir: string,
+  fs: { exists: (p: string) => boolean; ensureShim: (shimDir: string, links: Array<[string, string]>) => boolean },
+): string {
   if (!venvDir) return ''
-  const bin = join(venvDir, 'bin')
-  if (!exists(bin)) return ''
-  if (/["$`\\]/.test(bin)) {
-    logger.warn({ venvDir }, 'fleetVenvPathPrefix: venv path contains a shell-active character; PATH prefix skipped')
+  if (!fs.exists(join(venvDir, 'bin', 'python3'))) return ''
+  if (/["$`\\]/.test(shimDir)) {
+    logger.warn({ shimDir }, 'fleetPythonShimPrefix: shim path contains a shell-active character; PATH prefix skipped')
     return ''
   }
-  return `${bin}:`
+  const links: Array<[string, string]> = []
+  for (const tool of PYTHON_SHIM_TOOLS) {
+    const target = join(venvDir, 'bin', tool)
+    if (fs.exists(target)) links.push([tool, target])
+  }
+  if (!fs.ensureShim(shimDir, links)) return ''
+  return `${shimDir}:`
+}
+
+// Real fs seam: (re)points the shim symlinks idempotently and removes a tool
+// the venv no longer has. Any failure means "off" for this launch, logged.
+function ensureShimOnDisk(shimDir: string, links: Array<[string, string]>): boolean {
+  try {
+    mkdirSync(shimDir, { recursive: true })
+    const wanted = new Set(links.map(([tool]) => tool))
+    for (const tool of PYTHON_SHIM_TOOLS) {
+      const linkPath = join(shimDir, tool)
+      if (!wanted.has(tool)) { rmSync(linkPath, { force: true }); continue }
+    }
+    for (const [tool, target] of links) {
+      const linkPath = join(shimDir, tool)
+      let current: string | null = null
+      try { current = readlinkSync(linkPath) } catch { current = null }
+      if (current === target) continue
+      rmSync(linkPath, { force: true })
+      symlinkSync(target, linkPath)
+    }
+    return true
+  } catch (err) {
+    logger.warn({ err, shimDir }, 'fleetPythonShimPrefix: could not build the python shim; PATH prefix skipped')
+    return false
+  }
+}
+
+export const FLEET_PYTHON_SHIM_DIR = join(STORE_DIR, 'python-shim')
+
+export function fleetVenvPathPrefix(venvDir: string = FLEET_PYTHON_VENV, shimDir: string = FLEET_PYTHON_SHIM_DIR): string {
+  return fleetPythonShimPrefix(venvDir, shimDir, { exists: existsSync, ensureShim: ensureShimOnDisk })
 }
 import { getEffectiveSettingValue } from '../settings-store.js'
 import { filterInheritableMcpServers, readInheritableMcpServerNames, logNotInherited } from './mcp-inheritance.js'
