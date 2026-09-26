@@ -67,6 +67,16 @@ export function readFileOr(path: string, fallback: string): string {
 // layer answers 500 with the message) instead of destroying the file. Same
 // rule hook-registration-guard already applies to settings.json ("never
 // destroy a user's settings on a parse error").
+// A JSON.parse error message is NOT safe to log: on Node 22 V8 quotes ~10
+// characters of the input around the bad byte ("Unexpected token 's',
+// ..."API_KEY":sk-FAKE-12"... is not valid JSON"), and the files this helper
+// guards (.mcp.json, settings.json) are exactly the ones that carry API keys.
+// Keep only the position, never the excerpt (review on #1600).
+export function redactJsonParseMessage(message: string): string {
+  const pos = /at position \d+(?: \(line \d+ column \d+\))?/.exec(message)
+  return pos ? `SyntaxError ${pos[0]}` : 'SyntaxError (excerpt omitted)'
+}
+
 export function readJsonObjectForWrite(path: string): Record<string, unknown> {
   if (!existsSync(path)) return {}
   let raw: string
@@ -81,7 +91,7 @@ export function readJsonObjectForWrite(path: string): Record<string, unknown> {
   try {
     parsed = JSON.parse(raw)
   } catch (err) {
-    logger.warn({ path, err: (err as Error)?.message }, 'JSON config is not valid JSON -- refusing to overwrite it (fix or remove the file)')
+    logger.warn({ path, err: redactJsonParseMessage(String((err as Error)?.message ?? err)) }, 'JSON config is not valid JSON -- refusing to overwrite it (fix or remove the file)')
     throw new Error(`${path} is not valid JSON; refusing to overwrite it`)
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
