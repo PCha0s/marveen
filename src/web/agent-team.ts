@@ -9,7 +9,7 @@
 import { join } from 'node:path'
 import { MAIN_AGENT_ID } from '../config.js'
 import { atomicWriteFileSync } from './atomic-write.js'
-import { agentDir, readFileOr, listAgentNames, readAgentSecurityProfile } from './agent-config.js'
+import { agentDir, readFileOr, listAgentNames, readAgentSecurityProfile , readJsonObjectForWrite } from './agent-config.js'
 
 export interface TeamConfig {
   role: 'leader' | 'member'
@@ -83,7 +83,7 @@ export function resolveAgentSecurityProfile(name: string): string {
 export function writeAgentTeam(name: string, team: TeamConfig): void {
   const configPath = join(agentDir(name), 'agent-config.json')
   let config: Record<string, unknown> = {}
-  try { config = JSON.parse(readFileOr(configPath, '{}')) } catch {}
+  config = readJsonObjectForWrite(configPath)
   config.team = team
   atomicWriteFileSync(configPath, JSON.stringify(config, null, 2))
 }
