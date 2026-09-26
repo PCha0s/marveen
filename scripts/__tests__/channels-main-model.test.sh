@@ -179,8 +179,8 @@ fi
 # MODELSUGGEST923 (2026-09-26): bumped from claude-opus-5[1m] -- OPUS55SELECTOR922
 # (#1492) added claude-opus-5-5[1m] to the picker but never bumped this
 # constant, so model-suggest.ts (which reuses it as its top-tier ceiling) kept
-# recommending the older, pricier claude-opus-5[1m] ($15/M) as an "upgrade"
-# over agents already correctly running claude-opus-5-5[1m] ($4/M). This pin
+# recommending the older claude-opus-5[1m] as an "upgrade" over agents
+# already correctly running claude-opus-5-5[1m]. This pin
 # is deliberately literal, same as before: it must go red on the NEXT tier
 # bump too, not silently track whatever the constant says.
 registry_default="$(grep -oE "DISTRIBUTION_DEFAULT_AGENT_MODEL = '[^']+'" "$INSTALL_DIR/src/config-registry.ts" | head -1 | sed "s/.*'\(.*\)'/\1/")"

@@ -35,15 +35,29 @@
 // non-1M form.
 // MODELSUGGEST923 (measured 2026-09-26): OPUS55SELECTOR922 (#1492, 2026-09-23)
 // added claude-opus-5-5[1m] to the picker's valueSet but never bumped THIS
-// constant, so model-suggest.ts kept recommending the older, pricier
-// claude-opus-5[1m] ($15/M input) as an "upgrade" over agents already running
-// claude-opus-5-5[1m] ($4/M input, confirmed pricing) -- a real regression
-// suggestion, live on 5 of 5 fleet agents including two already on 5.5. This
-// is the exact drift class MODELSUGGEST807 already fixed once (for the 4.8->5
+// constant, so model-suggest.ts kept recommending the older claude-opus-5[1m]
+// as an "upgrade" over agents already running claude-opus-5-5[1m] -- a real
+// regression suggestion, live on 5 of 5 fleet agents including two already on
+// 5.5. The picker already offers 5.5, so the ceiling must follow. This is the
+// exact drift class MODELSUGGEST807 already fixed once (for the 4.8->5
 // transition); it recurred because that fix anchored the ceiling to this
 // constant instead of to "whatever the newest tier is", and nothing bumps
 // this constant automatically when a new tier ships.
 export const DISTRIBUTION_DEFAULT_AGENT_MODEL = 'claude-opus-5-5[1m]'
+
+// DEFAULTCLIGUARD927: the tier a MODEL-LESS launch falls back to when the
+// installed Claude Code CLI is measured (claude-cli-support.ts) not to launch
+// DISTRIBUTION_DEFAULT_AGENT_MODEL. The default above reaches every existing
+// model-less install on a plain code update, and nothing else on that launch
+// path checks the CLI: an AVX-less host is pinned to CLI 2.1.110 (CLAUDE_PIN
+// in channels.sh / install-linux.sh / fix-avx.sh), DISABLE_AUTOUPDATER keeps
+// any older CLI where it is, and on such a CLI claude-opus-5-5 answers every
+// prompt with 400 unrecognized_model -- the session comes up and goes silent.
+// This must be a model the OLDEST pinned CLI launches (a test pins that), and
+// it moves one tier up whenever the default does. Explicit operator values
+// (MAIN_AGENT_MODEL, a settings.json model, an agent's own model, a configured
+// DEFAULT_AGENT_MODEL) are never replaced by it.
+export const DISTRIBUTION_DEFAULT_FALLBACK_MODEL = 'claude-opus-5[1m]'
 
 export type SettingType = 'int' | 'string' | 'color' | 'boolean'
 

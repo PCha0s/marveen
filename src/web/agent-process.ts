@@ -60,6 +60,7 @@ import { parseTelegramToken } from './telegram.js'
 import { getProvider, getProviderType, channelStateDir, readChannelToken, type ChannelProviderType } from '../channel-provider.js'
 import { decideContinueFlag, verifyContinueLaunch } from './channel-continue-policy.js'
 import { measureClaudeCliVersion } from './claude-cli-version.js'
+import { launchableInstallDefault } from './default-model-guard.js'
 import { getClaudePidForSession, probeChannelPluginLiveness } from '../channel-coordinator/liveness.js'
 import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT, SUBAGENT_INBOX_TEE } from '../config.js'
 import { getEffectiveSettingValue } from '../settings-store.js'
@@ -1899,7 +1900,10 @@ export async function startAgentProcess(name: string, opts: { fresh?: boolean } 
     // all string-pattern discriminators. This prevents model ids like `mistral:7b`
     // from accidentally matching the Ollama branch when the operator intends a
     // custom Anthropic-compatible endpoint.
-    const rawModel = readAgentModel(name)
+    // DEFAULTCLIGUARD927: an agent that resolved no model of its own launches
+    // the install default, guarded against a CLI that cannot run it.
+    const resolvedModel = resolveAgentModelDetailed(name)
+    const rawModel = resolvedModel.source === 'default' ? await launchableInstallDefault(`agent:${name}`) : resolvedModel.model
     const customProviderId = readAgentCustomProvider(name)
     // isCustom is true whenever an id is set -- even if the definition is missing.
     // The guard below catches the missing-definition case and aborts before any

@@ -112,6 +112,11 @@ export const APP_TZ_INVALID = appTz.invalid
 // reconfigures a running fleet.
 export const DEFAULT_AGENT_MODEL =
   cfg('DEFAULT_AGENT_MODEL') || DISTRIBUTION_DEFAULT_AGENT_MODEL
+// DEFAULTCLIGUARD927: true when no operator configured DEFAULT_AGENT_MODEL, so
+// the value above is the SHIPPED default. Only then may a launch swap it for
+// the previous tier on a CLI that cannot run it (default-model-guard.ts); a
+// configured value is the operator's choice and is never replaced.
+export const DEFAULT_AGENT_MODEL_IS_DISTRIBUTION = !cfg('DEFAULT_AGENT_MODEL')
 
 export const TELEGRAM_BOT_TOKEN = env['TELEGRAM_BOT_TOKEN'] ?? ''
 export const ALLOWED_CHAT_ID = env['ALLOWED_CHAT_ID'] ?? ''

@@ -221,10 +221,10 @@ describe('suggestForAgent -- reason structure (6 sections)', () => {
 // OPUS55SELECTOR922 (#1492, 2026-09-23) added claude-opus-5-5[1m] to the
 // picker's valueSet but never bumped DISTRIBUTION_DEFAULT_AGENT_MODEL, so
 // this suite's own "locks to" pin below was still asserting the OLD ceiling
-// (claude-opus-5[1m], $15/M) while the picker already offered a
-// strictly-better, cheaper one (claude-opus-5-5[1m], $4/M) -- live effect:
-// the advisor told 5 of 5 fleet agents to move to the pricier, older tier,
-// including two agents already correctly running 5.5. Bumped the constant in
+// (claude-opus-5[1m]) while the picker already offered the newer tier
+// (claude-opus-5-5[1m]) -- live effect: the advisor told 5 of 5 fleet agents
+// to move to the older tier, including two agents already correctly running
+// 5.5. Bumped the constant in
 // config-registry.ts; this pin now locks to the new value so the NEXT tier
 // bump fails here too, on purpose, instead of shipping silently.
 describe('MODELSUGGEST807 -- top tier is the shipped distribution default', () => {

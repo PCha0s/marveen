@@ -15,6 +15,7 @@ import { ensureFederationClaudeMdSection } from '../federation/onboarding.js'
 import { atomicWriteFileSync } from '../atomic-write.js'
 import { snapshotPersonaFile, writePersonaFileIfUnchanged } from '../persona-write-guard.js'
 import { measureClaudeCliVersion } from '../claude-cli-version.js'
+import { launchableInstallDefault } from '../default-model-guard.js'
 import { claudeSupportForCli, isModelUnsupportedByCli, CLAUDE_MODEL_MIN_CLI } from '../../claude-cli-support.js'
 import { CHANNEL_PLUGIN_IDS } from '../plugin-ids.js'
 import { getSecret, setSecret, deleteSecret, listSecrets } from '../vault.js'
@@ -23,7 +24,6 @@ import { listCustomProviders } from '../custom-providers.js'
 import {
   agentDir,
   agentConfigRoot,
-  DEFAULT_MODEL,
   readFileOr,
   extractDescriptionFromClaudeMd,
   findAvatarForAgent,
@@ -1023,7 +1023,11 @@ export async function tryHandleAgents(ctx: RouteContext, webDir: string): Promis
     const { description, model: rawModel, profile: rawProfile } = data as { name: string; description: string; model?: string; profile?: string }
     const rawName = typeof data.name === 'string' ? data.name.trim() : ''
     const name = sanitizeAgentName(rawName)
-    const model = resolveModelId(rawModel || DEFAULT_MODEL)
+    // DEFAULTCLIGUARD927: no model in the request = the install default,
+    // guarded (fresh probe, like the gate below) so a create on a CLI that
+    // cannot run the shipped default gets the previous tier, not a 422 for a
+    // model the caller never picked.
+    const model = resolveModelId(rawModel || await launchableInstallDefault('agent-create', { fresh: true }))
     const profileId = (rawProfile || 'default').trim() || 'default'
 
     if (!name) { json(res, { error: 'Name is required' }, 400); return true }

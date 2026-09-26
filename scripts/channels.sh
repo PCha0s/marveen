@@ -178,12 +178,65 @@ resolve_main_model() {
     echo "resolve_main_model: dist/config-registry.js missing (build not present yet?); main-agent model left UNSET" >>"$_fail_log" 2>/dev/null || true
     return 0
   fi
-  local _def
-  _def="$("$_node" -e 'try { process.stdout.write(String(require(process.argv[1]).DISTRIBUTION_DEFAULT_AGENT_MODEL || "")) } catch (e) { process.exit(3) }' "$INSTALL_DIR/dist/config-registry.js" 2>/dev/null)"
+  # DEFAULTCLIGUARD927: the shipped default is guarded against the INSTALLED
+  # CLI, through the same table and decision the dashboard uses
+  # (dist/claude-cli-support.js launchableDefaultModel; the TS twin is
+  # readConfiguredMainModel, and main-model-resolution-parity.test.ts keeps the
+  # two equal). An AVX-less host is pinned to CLI 2.1.110 (CLAUDE_PIN below)
+  # and DISABLE_AUTOUPDATER keeps any older CLI in place, so a default that
+  # CLI cannot run would bring the session up and 400 every prompt -- a silent
+  # bot. On a CLI measured too old, the previous tier
+  # (DISTRIBUTION_DEFAULT_FALLBACK_MODEL) launches instead, with a named line.
+  # Fail-open: an unmeasurable version, or a dist without the guard, keeps the
+  # default (the latter is named too). MARVEEN_CLAUDE_CLI_VERSION overrides the
+  # probe exactly as on the TS side (empty = unmeasured).
+  # The probe needs the SAME binary the launch runs. The watchdogs call this
+  # seam under a narrow launchd PATH, so after PATH try the dirs the TS side
+  # probes (platform.ts KNOWN_BIN_DIRS); a miss is unmeasured = fail-open.
+  local _claude="${CLAUDE:-}"
+  [ -z "$_claude" ] && _claude="$(command -v claude 2>/dev/null || true)"
+  if [ -z "$_claude" ]; then
+    for _c in "$HOME/.local/bin/claude" "$HOME/.bun/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude /usr/bin/claude /bin/claude; do
+      [ -x "$_c" ] && { _claude="$_c"; break; }
+    done
+  fi
+  local _res _def _note=""
+  _res="$("$_node" -e '
+    let reg
+    try { reg = require(process.argv[1]) } catch (e) { process.exit(3) }
+    const def = String(reg.DISTRIBUTION_DEFAULT_AGENT_MODEL || "")
+    if (!def) process.exit(0)
+    let model = def, note = ""
+    try {
+      const sup = require(process.argv[2])
+      const fallback = String(reg.DISTRIBUTION_DEFAULT_FALLBACK_MODEL || "")
+      if (!fallback || typeof sup.launchableDefaultModel !== "function") throw new Error("no guard")
+      let ver = null
+      if (process.env.MARVEEN_CLAUDE_CLI_VERSION !== undefined) {
+        ver = sup.parseClaudeVersion(process.env.MARVEEN_CLAUDE_CLI_VERSION)
+      } else if (process.argv[3]) {
+        try {
+          ver = sup.parseClaudeVersion(require("node:child_process").execFileSync(process.argv[3], ["--version"],
+            { encoding: "utf-8", timeout: 10000, stdio: ["ignore", "pipe", "ignore"] }))
+        } catch (e) { ver = null }
+      }
+      const d = sup.launchableDefaultModel(def, fallback, ver)
+      model = d.model
+      if (d.replaced) note = "DEFAULTCLIGUARD927: installed Claude Code " + ver + " cannot launch the distribution default " + d.replaced + " (needs >= " + d.minCli + "); main agent launches " + d.model
+    } catch (e) {
+      note = "DEFAULTCLIGUARD927: guard unavailable (stale dist/claude-cli-support.js or config-registry.js); distribution default " + def + " used unguarded"
+    }
+    process.stdout.write(model + "\n" + note)
+  ' "$INSTALL_DIR/dist/config-registry.js" "$INSTALL_DIR/dist/claude-cli-support.js" "$_claude" 2>/dev/null)"
+  _def="${_res%%$'\n'*}"
+  case "$_res" in *$'\n'*) _note="${_res#*$'\n'}" ;; esac
   if [ -z "$_def" ]; then
     echo "resolve_main_model: read of DISTRIBUTION_DEFAULT_AGENT_MODEL was empty (stale or broken dist/config-registry.js); main-agent model left UNSET" >>"$_fail_log" 2>/dev/null || true
     return 0
   fi
+  # The group's own 2>/dev/null: a >> into a missing store/ fails BEFORE an
+  # inner 2>/dev/null takes effect, and would print into the caller's stderr.
+  [ -n "$_note" ] && { { echo "resolve_main_model: $_note" >>"$_fail_log"; } 2>/dev/null || true; }
   printf '%s' "$_def"
 }
 

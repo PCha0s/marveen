@@ -9,7 +9,7 @@ import { WEB_PORT } from '../config.js'
 import { logger } from '../logger.js'
 import { mainRelaunchSucceeded } from '../auto-restart.js'
 import { MAIN_AGENT_ID, SERVICE_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
-import { DISTRIBUTION_DEFAULT_AGENT_MODEL } from '../config-registry.js'
+import { launchableDistributionDefaultSync } from './default-model-guard.js'
 import { agentDir, listAgentNames, readAgentChannelProvider } from './agent-config.js'
 import { listKanbanCards } from '../db.js'
 import {
@@ -770,7 +770,9 @@ export function readConfiguredMainModel(projectRoot: string = PROJECT_ROOT): str
     // fall through to the distribution default -- an unreadable settings file
     // must degrade the same way as a model-less one, never to a flag-less spawn
   }
-  return DISTRIBUTION_DEFAULT_AGENT_MODEL
+  // DEFAULTCLIGUARD927: same guard as channels.sh's third layer -- on a CLI
+  // measured not to run the shipped default, the previous tier.
+  return launchableDistributionDefaultSync('main')
 }
 
 // Secondary channel plugins the main session co-listens on, read from .env
