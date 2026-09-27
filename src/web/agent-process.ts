@@ -3259,13 +3259,15 @@ export function computeTmuxChunk(
 ): { chunk: string; end: number } {
   let end = Math.min(start + chunkSize, oneLine.length)
   let slide = 0
-  // Dodge 1: don't let the NEXT chunk start with '-' (fold it into this one).
-  while (end < oneLine.length && oneLine[end] === '-' && slide < maxSlide) {
-    end++; slide++
-  }
-  // Dodge 2: don't let THIS chunk end with ';' (fold the next char in
-  // instead). Runs after dodge 1 so it sees the boundary dodge 1 settled on.
-  while (end < oneLine.length && oneLine[end - 1] === ';' && slide < maxSlide) {
+  // Both dodges in ONE loop: don't let the NEXT chunk start with '-', and
+  // don't let THIS chunk end with ';'. Folding a character in for one rule can
+  // re-trigger the other: with two sequential loops, ';x-' at the boundary
+  // slid past the ';' and stopped right before the '-', so the next chunk got
+  // a ' ' prepended -- a space typed into the middle of the text.
+  while (
+    end < oneLine.length && slide < maxSlide &&
+    (oneLine[end] === '-' || oneLine[end - 1] === ';')
+  ) {
     end++; slide++
   }
   let chunk = oneLine.slice(start, end)

@@ -75,6 +75,21 @@ describe('computeTmuxChunk', () => {
     expect(end).toBeGreaterThan(80)
   })
 
+  it("';x-' at the boundary: folding past the ';' must not leave the next chunk starting with '-' (no space typed into the text)", () => {
+    // Two sequential dodge loops slid past the ';' and stopped right before
+    // the '-', so the NEXT chunk started with '-' and got a ' ' prepended.
+    const text = 'a'.repeat(79) + ';x-szal folytatva'
+    const out = reassemble(text, 80)
+    expect(out).toBe(text)
+    let i = 0
+    while (i < text.length) {
+      const { chunk, end } = computeTmuxChunk(text, i, 80)
+      expect(chunk.startsWith('-')).toBe(false)
+      expect(chunk.endsWith(';')).toBe(false)
+      i = end
+    }
+  })
+
   it('handles a chunk that would both start with a slid-past dash and end near a ;', () => {
     const text = 'a'.repeat(80) + '-' + ';'.repeat(3) + 'z'.repeat(40)
     let i = 0
