@@ -62,6 +62,7 @@ import { decideContinueFlag, verifyContinueLaunch } from './channel-continue-pol
 import { measureClaudeCliVersion } from './claude-cli-version.js'
 import { getClaudePidForSession, probeChannelPluginLiveness } from '../channel-coordinator/liveness.js'
 import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT, SUBAGENT_INBOX_TEE, FLEET_PYTHON_VENV } from '../config.js'
+import { fleetVenvBin } from '../fleet-venv.js'
 
 // FLEETVENV923: the `<venv>/bin:` prefix for a launch PATH, or '' when the venv
 // has no bin/ directory or its path cannot sit safely inside the double-quoted
@@ -70,14 +71,9 @@ import { CHANNEL_PROVIDER, MAIN_AGENT_ID, STORE_DIR, PROJECT_ROOT, SUBAGENT_INBO
 // with a warning, because a fleet venv at such a path is a config mistake).
 // Exported for unit tests; `exists` is the seam.
 export function fleetVenvPathPrefix(venvDir: string = FLEET_PYTHON_VENV, exists: (p: string) => boolean = existsSync): string {
-  if (!venvDir) return ''
-  const bin = join(venvDir, 'bin')
-  if (!exists(bin)) return ''
-  if (/["$`\\]/.test(bin)) {
-    logger.warn({ venvDir }, 'fleetVenvPathPrefix: venv path contains a shell-active character; PATH prefix skipped')
-    return ''
-  }
-  return `${bin}:`
+  const { prefix, refused } = fleetVenvBin(venvDir, exists)
+  if (refused) logger.warn({ venvDir }, 'fleetVenvPathPrefix: venv path contains a shell-active character; PATH prefix skipped')
+  return prefix
 }
 import { getEffectiveSettingValue } from '../settings-store.js'
 import { filterInheritableMcpServers, readInheritableMcpServerNames, logNotInherited } from './mcp-inheritance.js'

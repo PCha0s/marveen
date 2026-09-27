@@ -557,20 +557,25 @@ unset TMUX
 
 export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
-# FLEETVENV923: the fleet Python venv's bin/ goes FIRST, when it exists, so the
-# main session's `python3` (and markitdown & co.) come from the venv -- parity
-# with startAgentProcess (sub-agents) and the channel-monitor recovery relaunch.
-# Read from .env the same way as MAIN_AGENT_ID above (no `set -a`); a leading
-# `~` means $HOME; a missing directory disables the prefix.
-FLEET_PYTHON_VENV=""
-if [ -f "$INSTALL_DIR/.env" ]; then
-  FLEET_PYTHON_VENV="$(grep -E '^FLEET_PYTHON_VENV=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
+# FLEETVENV923: the fleet Python venv's bin/ goes FIRST, when it is set and
+# exists, so the main session's `python3` (and markitdown & co.) come from the
+# venv -- parity with startAgentProcess (sub-agents) and the channel-monitor
+# recovery relaunch. Resolved by scripts/fleet-venv-prefix.mjs through the SAME
+# functions those launchers use (dist/fleet-venv.js: Settings-page override >
+# .env > off). A grep/cut parse here disagreed with them on a quoted value, an
+# empty value and a Settings-page override (#1626 review). No node or no dist
+# yet = no prefix, and the reason is named in channels-failures.log.
+mkdir -p "$INSTALL_DIR/store" 2>/dev/null || true
+FLEET_VENV_PREFIX=""
+_fleet_node="$(command -v node 2>/dev/null || true)"
+if [ -n "$_fleet_node" ] && [ -f "$INSTALL_DIR/dist/fleet-venv.js" ]; then
+  FLEET_VENV_PREFIX="$("$_fleet_node" "$INSTALL_DIR/scripts/fleet-venv-prefix.mjs" 2>>"$INSTALL_DIR/store/channels-failures.log" || true)"
+else
+  { echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: fleet venv PATH prefix skipped (node or dist/fleet-venv.js missing)" >> "$INSTALL_DIR/store/channels-failures.log"; } 2>/dev/null || true
 fi
-FLEET_PYTHON_VENV="${FLEET_PYTHON_VENV:-~/.klaudia-venv}"
-case "$FLEET_PYTHON_VENV" in "~"*) FLEET_PYTHON_VENV="$HOME${FLEET_PYTHON_VENV#\~}" ;; esac
-if [ -d "$FLEET_PYTHON_VENV/bin" ]; then
-  export PATH="$FLEET_PYTHON_VENV/bin:$PATH"
-fi
+case "$FLEET_VENV_PREFIX" in
+  /*:) if [ -d "${FLEET_VENV_PREFIX%:}" ]; then export PATH="$FLEET_VENV_PREFIX$PATH"; fi ;;
+esac
 
 # Root VPS / container: Claude Code refuses --dangerously-skip-permissions when
 # running as uid 0 ("cannot be used with root/sudo privileges"), so the tmux

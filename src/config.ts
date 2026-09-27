@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readEnvFile } from './env.js'
+import { resolveFleetVenvDir } from './fleet-venv.js'
 import { DISTRIBUTION_DEFAULT_AGENT_MODEL } from './config-registry.js'
 import { getProviderType, getChannelToken, getChannelChatId, type ChannelProviderType } from './channel-provider.js'
 
@@ -340,10 +341,11 @@ export const AGENT_API_ORIGIN = cfg('AGENT_API_ORIGIN') ?? ''
 // (markitdown, ...) resolve to the venv without per-skill interpreter paths.
 // Measured 2026-09-23 on the Mac mini: the Homebrew python3 carried zero
 // packages, so every skill `python3` call import-failed while a venv with the
-// packages sat next to it. A `~` prefix means the home directory; a
-// nonexistent directory (or an empty string) disables the prefix.
-const _fleetVenvRaw = cfg('FLEET_PYTHON_VENV') ?? '~/.klaudia-venv'
-export const FLEET_PYTHON_VENV = _fleetVenvRaw.startsWith('~') ? join(homedir(), _fleetVenvRaw.slice(1)) : _fleetVenvRaw
+// packages sat next to it. A `~` prefix means the home directory; the default
+// is EMPTY (off), and a nonexistent directory disables the prefix too.
+// Resolved by fleet-venv.ts, the same function channels.sh reaches through
+// scripts/fleet-venv-prefix.mjs, so the two launch paths cannot disagree.
+export const FLEET_PYTHON_VENV = resolveFleetVenvDir(PROJECT_ROOT, homedir(), process.env.CLAUDECLAW_ENV_DIR ?? PROJECT_ROOT)
 // Extra browser origins allowed to make state-changing dashboard requests
 // (CORS + CSRF allowlist), comma-separated, e.g. for VPN/LAN addresses that
 // aren't covered by WEB_HOST or DASHBOARD_PUBLIC_URL. Empty by default so

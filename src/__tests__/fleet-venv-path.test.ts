@@ -10,12 +10,14 @@
 
 import { describe, it, expect } from 'vitest'
 import { fleetVenvPathPrefix } from '../web/agent-process.js'
+import { resolveFleetVenvDir, fleetVenvBin } from '../fleet-venv.js'
 import { SETTINGS_REGISTRY } from '../config-registry.js'
 import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import ts from 'typescript'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const AGENT_PROCESS = readFileSync(join(__dirname, '..', 'web', 'agent-process.ts'), 'utf-8')
@@ -48,16 +50,16 @@ describe('fleetVenvPathPrefix', () => {
 })
 
 describe('FLEETVENV923 wiring (source-level)', () => {
-  it('config.ts exports FLEET_PYTHON_VENV with the ~/.klaudia-venv default and tilde expansion', () => {
-    expect(CONFIG).toContain("const _fleetVenvRaw = cfg('FLEET_PYTHON_VENV') ?? '~/.klaudia-venv'")
-    expect(CONFIG).toContain("export const FLEET_PYTHON_VENV = _fleetVenvRaw.startsWith('~') ? join(homedir(), _fleetVenvRaw.slice(1)) : _fleetVenvRaw")
+  it('config.ts resolves FLEET_PYTHON_VENV through fleet-venv.ts (the function channels.sh shares)', () => {
+    expect(CONFIG).toContain('export const FLEET_PYTHON_VENV = resolveFleetVenvDir(PROJECT_ROOT, homedir(), process.env.CLAUDECLAW_ENV_DIR ?? PROJECT_ROOT)')
   })
 
-  it('the config registry documents the key as a restart-requiring system string', () => {
+  it('the config registry documents the key as a restart-requiring system string, OFF by default', () => {
     const entry = SETTINGS_REGISTRY.find((e) => e.key === 'FLEET_PYTHON_VENV')
     expect(entry).toBeDefined()
     expect(entry?.type).toBe('string')
-    expect(entry?.default).toBe('~/.klaudia-venv')
+    // No install-specific directory ships upstream: an install with a venv sets the key.
+    expect(entry?.default).toBe('')
     expect(entry?.requiresRestart).toBe(true)
     expect(entry?.secret).toBe(false)
   })
@@ -71,48 +73,93 @@ describe('FLEETVENV923 wiring (source-level)', () => {
     expect(CHANNEL_MONITOR).toContain('`export PATH="${fleetVenvPathPrefix()}/opt/homebrew/bin:$HOME/.bun/bin:')
   })
 
-  it('channels.sh reads FLEET_PYTHON_VENV from .env without set -a and prepends <venv>/bin when it exists', () => {
-    expect(CHANNELS_SH).toContain("FLEET_PYTHON_VENV=\"$(grep -E '^FLEET_PYTHON_VENV=' \"$INSTALL_DIR/.env\" | head -1 | cut -d= -f2-)\"")
-    expect(CHANNELS_SH).toContain('FLEET_PYTHON_VENV="${FLEET_PYTHON_VENV:-~/.klaudia-venv}"')
-    expect(CHANNELS_SH).toContain('if [ -d "$FLEET_PYTHON_VENV/bin" ]; then\n  export PATH="$FLEET_PYTHON_VENV/bin:$PATH"\nfi')
-    // The venv block must not widen to `set -a && source .env` (that would export every secret).
-    expect(CHANNELS_SH.slice(CHANNELS_SH.indexOf('# FLEETVENV923:'))).not.toContain('source "$INSTALL_DIR/.env"')
+  it('channels.sh asks the shared helper, and no longer parses the key itself', () => {
+    const block = CHANNELS_SH.slice(CHANNELS_SH.indexOf('# FLEETVENV923:'))
+    expect(CHANNELS_SH).toContain('"$INSTALL_DIR/scripts/fleet-venv-prefix.mjs"')
+    expect(CHANNELS_SH).not.toMatch(/grep -E '\^FLEET_PYTHON_VENV='/)
+    // Never widen to `set -a && source .env` (that would export every secret).
+    expect(block).not.toContain('source "$INSTALL_DIR/.env"')
   })
 })
 
-describe('channels.sh venv block (executed)', () => {
-  // Extract the block between the base PATH export and the end of the venv `if`,
-  // run it under bash with a fake INSTALL_DIR/.env and HOME, and read PATH back.
+// The review's measurement, as an executed test: the SAME settings drive the
+// TypeScript side (resolveFleetVenvDir + fleetVenvBin, what config.ts and the
+// launchers use) and the real channels.sh block, which runs the real helper
+// script against the real fleet-venv.ts / env-parse.ts, transpiled into the
+// fixture's dist/. Every case must give the same PATH on both sides.
+describe('channels.sh and the TypeScript launchers resolve FLEET_PYTHON_VENV the same way (executed)', () => {
+  const REPO = join(__dirname, '..', '..')
   const start = CHANNELS_SH.indexOf('# FLEETVENV923:')
-  const endMarker = 'export PATH="$FLEET_PYTHON_VENV/bin:$PATH"\nfi\n'
-  const end = CHANNELS_SH.indexOf(endMarker, start) + endMarker.length
-  const block = CHANNELS_SH.slice(start, end)
+  const endMarker = 'esac\n'
+  const block = CHANNELS_SH.slice(start, CHANNELS_SH.indexOf(endMarker, start) + endMarker.length)
+  const transpile = (rel: string) => ts.transpileModule(readFileSync(join(REPO, 'src', rel), 'utf-8'),
+    { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 } }).outputText
+  const FLEET_JS = transpile('fleet-venv.ts')
+  const PARSE_JS = transpile('env-parse.ts')
+  const HELPER = readFileSync(join(REPO, 'scripts', 'fleet-venv-prefix.mjs'), 'utf-8')
+  const NODE_DIR = dirname(process.execPath)
+  const BASE = `${NODE_DIR}:/usr/bin:/bin`
 
-  function run(envLine: string | null, makeVenv: boolean, venvRel = '.klaudia-venv'): string {
+  interface Case { env?: string; override?: unknown; venvs?: string[]; dist?: boolean }
+  function run(c: Case): { shell: string; ts: string; log: string } {
     const home = mkdtempSync(join(tmpdir(), 'fleet-venv-'))
     try {
       const install = join(home, 'install')
-      mkdirSync(install)
-      if (envLine !== null) writeFileSync(join(install, '.env'), envLine + '\n')
-      if (makeVenv) mkdirSync(join(home, venvRel, 'bin'), { recursive: true })
-      const script = `INSTALL_DIR="${install}"\nexport PATH="/usr/bin:/bin"\n${block}\nprintf '%s' "$PATH"\n`
-      return execFileSync('bash', ['-c', script], { env: { HOME: home, PATH: '/usr/bin:/bin' }, encoding: 'utf-8' })
-        .replace(home, '$HOME')
+      for (const d of ['dist', 'scripts', 'store']) mkdirSync(join(install, d), { recursive: true })
+      writeFileSync(join(install, 'package.json'), '{"type":"module"}\n')
+      if (c.dist !== false) {
+        writeFileSync(join(install, 'dist', 'fleet-venv.js'), FLEET_JS)
+        writeFileSync(join(install, 'dist', 'env-parse.js'), PARSE_JS)
+      }
+      writeFileSync(join(install, 'scripts', 'fleet-venv-prefix.mjs'), HELPER)
+      if (c.env !== undefined) writeFileSync(join(install, '.env'), c.env.replaceAll('$HOME', home) + '\n')
+      if (c.override !== undefined) {
+        const ov = typeof c.override === 'string' ? c.override.replaceAll('$HOME', home) : c.override
+        writeFileSync(join(install, 'store', 'config-overrides.json'), JSON.stringify({ FLEET_PYTHON_VENV: ov }))
+      }
+      for (const v of c.venvs ?? []) mkdirSync(join(home, v, 'bin'), { recursive: true })
+      const script = `INSTALL_DIR="${install}"\nexport PATH="${BASE}"\n${block}\nprintf '%s' "$PATH"\n`
+      const shell = execFileSync('bash', ['-c', script], { env: { HOME: home, PATH: BASE }, encoding: 'utf-8' })
+      const tsPrefix = fleetVenvBin(resolveFleetVenvDir(install, home)).prefix
+      let log = ''
+      try { log = readFileSync(join(install, 'store', 'channels-failures.log'), 'utf-8') } catch { /* none */ }
+      const norm = (s: string) => s.replaceAll(home, '$HOME')
+      return { shell: norm(shell), ts: norm(tsPrefix + BASE), log: norm(log) }
     } finally {
       rmSync(home, { recursive: true, force: true })
     }
   }
+  const ON = (dir: string) => `$HOME/${dir}/bin:${BASE}`
 
-  it('prepends $HOME/.klaudia-venv/bin by default when the directory exists', () => {
-    expect(run(null, true)).toBe('$HOME/.klaudia-venv/bin:/usr/bin:/bin')
+  // [label, case, expected PATH]
+  const CASES: Array<[string, Case, string]> = [
+    ['no key: OFF by default, even with ~/.klaudia-venv present', { venvs: ['.klaudia-venv'] }, BASE],
+    ['plain absolute path in .env', { env: 'FLEET_PYTHON_VENV=$HOME/myvenv', venvs: ['myvenv'] }, ON('myvenv')],
+    ['double-quoted value in .env', { env: 'FLEET_PYTHON_VENV="$HOME/myvenv"', venvs: ['myvenv'] }, ON('myvenv')],
+    ['single-quoted value in .env', { env: "FLEET_PYTHON_VENV='$HOME/myvenv'", venvs: ['myvenv'] }, ON('myvenv')],
+    ['empty value in .env = off', { env: 'FLEET_PYTHON_VENV=', venvs: ['.klaudia-venv'] }, BASE],
+    ['leading ~ in .env = home', { env: 'FLEET_PYTHON_VENV=~/other-venv', venvs: ['other-venv'] }, ON('other-venv')],
+    ['set on the Settings page only (config-overrides.json)', { override: '$HOME/myvenv', venvs: ['myvenv'] }, ON('myvenv')],
+    ['disabled on the Settings page (/nonexistent) beats .env', { override: '/nonexistent', env: 'FLEET_PYTHON_VENV=$HOME/myvenv', venvs: ['myvenv'] }, BASE],
+    ['an EMPTY override does not count: .env applies (cfg() rule)', { override: '', env: 'FLEET_PYTHON_VENV=$HOME/myvenv', venvs: ['myvenv'] }, ON('myvenv')],
+    ['configured but the directory is missing = off', { env: 'FLEET_PYTHON_VENV=$HOME/gone' }, BASE],
+    ['a shell-active character is refused on both sides', { env: 'FLEET_PYTHON_VENV=$HOME/bad$venv', venvs: ['bad$venv'] }, BASE],
+  ]
+
+  it.each(CASES)('%s', (_label, c, want) => {
+    const r = run(c)
+    expect(r.shell).toBe(want)
+    expect(r.ts).toBe(want)
   })
 
-  it('leaves PATH alone when the venv directory is missing', () => {
-    expect(run(null, false)).toBe('/usr/bin:/bin')
+  it('a refused path is NAMED in channels-failures.log, not silently dropped', () => {
+    expect(run({ env: 'FLEET_PYTHON_VENV=$HOME/bad$venv', venvs: ['bad$venv'] }).log).toContain('shell-active character')
   })
 
-  it('honours FLEET_PYTHON_VENV from .env, with tilde expansion', () => {
-    expect(run('FLEET_PYTHON_VENV=~/other-venv', true, 'other-venv')).toBe('$HOME/other-venv/bin:/usr/bin:/bin')
+  it('no dist yet: no prefix, and the reason is named in channels-failures.log', () => {
+    const r = run({ env: 'FLEET_PYTHON_VENV=$HOME/myvenv', venvs: ['myvenv'], dist: false })
+    expect(r.shell).toBe(BASE)
+    expect(r.log).toContain('fleet venv PATH prefix skipped')
   })
 
   it('does not export unrelated .env keys into the shell', () => {
@@ -122,7 +169,7 @@ describe('channels.sh venv block (executed)', () => {
       mkdirSync(install)
       writeFileSync(join(install, '.env'), 'TELEGRAM_BOT_TOKEN=secret\nFLEET_PYTHON_VENV=~/.klaudia-venv\n')
       const script = `INSTALL_DIR="${install}"\n${block}\nprintf '%s' "\${TELEGRAM_BOT_TOKEN:-unset}"\n`
-      const out = execFileSync('bash', ['-c', script], { env: { HOME: home, PATH: '/usr/bin:/bin' }, encoding: 'utf-8' })
+      const out = execFileSync('bash', ['-c', script], { env: { HOME: home, PATH: BASE }, encoding: 'utf-8' })
       expect(out).toBe('unset')
     } finally {
       rmSync(home, { recursive: true, force: true })
