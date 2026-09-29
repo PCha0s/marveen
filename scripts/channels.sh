@@ -566,16 +566,10 @@ export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HO
 # empty value and a Settings-page override (#1626 review). No node or no dist
 # yet = no prefix, and the reason is named in channels-failures.log.
 mkdir -p "$INSTALL_DIR/store" 2>/dev/null || true
-FLEET_VENV_PREFIX=""
-_fleet_node="$(command -v node 2>/dev/null || true)"
-if [ -n "$_fleet_node" ] && [ -f "$INSTALL_DIR/dist/fleet-venv.js" ]; then
-  FLEET_VENV_PREFIX="$("$_fleet_node" "$INSTALL_DIR/scripts/fleet-venv-prefix.mjs" 2>>"$INSTALL_DIR/store/channels-failures.log" || true)"
-else
-  { echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: fleet venv PATH prefix skipped (node or dist/fleet-venv.js missing)" >> "$INSTALL_DIR/store/channels-failures.log"; } 2>/dev/null || true
-fi
-case "$FLEET_VENV_PREFIX" in
-  /*:) if [ -d "${FLEET_VENV_PREFIX%:}" ]; then export PATH="$FLEET_VENV_PREFIX$PATH"; fi ;;
-esac
+. "$INSTALL_DIR/scripts/fleet-venv-prefix.sh" 2>/dev/null || fleet_venv_prefix() { :; }
+FLEET_VENV_PREFIX="$(fleet_venv_prefix "$INSTALL_DIR" "$INSTALL_DIR/store/channels-failures.log")"
+[ -n "$FLEET_VENV_PREFIX" ] && export PATH="$FLEET_VENV_PREFIX$PATH"
+# /FLEETVENV923
 
 # Root VPS / container: Claude Code refuses --dangerously-skip-permissions when
 # running as uid 0 ("cannot be used with root/sudo privileges"), so the tmux

@@ -12,7 +12,7 @@
 // main session could get different PATHs.
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { parseEnvContent } from './env-parse.js'
 
 export const FLEET_PYTHON_VENV_KEY = 'FLEET_PYTHON_VENV'
@@ -53,13 +53,17 @@ function readOverride(projectRoot: string): string | undefined {
 
 /**
  * The `<venv>/bin:` PATH prefix, or '' when the setting is off or `<venv>/bin`
- * does not exist. `refused` = the path carries a shell-active character (`"`,
+ * does not exist. `refused` = the path is relative, or carries a shell-active character (`"`,
  * `$`, backtick, backslash) that the double-quoted `export PATH="..."` of a
  * launch command would re-interpret: skipped rather than escaped, because a
  * fleet venv at such a path is a config mistake. `exists` is the test seam.
  */
 export function fleetVenvBin(venvDir: string, exists: (p: string) => boolean = existsSync): { prefix: string; refused: boolean } {
   if (!venvDir) return { prefix: '', refused: false }
+  // Absolute only (after ~ expansion): a relative `venv` would resolve against
+  // each launch command's own `cd`, i.e. a different directory per agent, and
+  // the shell side rejects it anyway (#1626 review). Refused, not guessed.
+  if (!isAbsolute(venvDir)) return { prefix: '', refused: true }
   const bin = join(venvDir, 'bin')
   if (!exists(bin)) return { prefix: '', refused: false }
   if (/["$`\\]/.test(bin)) return { prefix: '', refused: true }

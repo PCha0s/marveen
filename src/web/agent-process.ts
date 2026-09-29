@@ -67,12 +67,13 @@ import { fleetVenvBin } from '../fleet-venv.js'
 // FLEETVENV923: the `<venv>/bin:` prefix for a launch PATH, or '' when the venv
 // has no bin/ directory or its path cannot sit safely inside the double-quoted
 // `export PATH="..."` of the launch command (a `"`, `$` or backtick in the
-// path would be re-interpreted by the shell -- skipped rather than escaped,
+// path would be re-interpreted by the shell; a relative path would resolve
+// against each launch's own `cd` -- skipped rather than escaped or guessed,
 // with a warning, because a fleet venv at such a path is a config mistake).
 // Exported for unit tests; `exists` is the seam.
 export function fleetVenvPathPrefix(venvDir: string = FLEET_PYTHON_VENV, exists: (p: string) => boolean = existsSync): string {
   const { prefix, refused } = fleetVenvBin(venvDir, exists)
-  if (refused) logger.warn({ venvDir }, 'fleetVenvPathPrefix: venv path contains a shell-active character; PATH prefix skipped')
+  if (refused) logger.warn({ venvDir }, 'fleetVenvPathPrefix: venv path is not absolute or contains a shell-active character; PATH prefix skipped')
   return prefix
 }
 import { getEffectiveSettingValue } from '../settings-store.js'

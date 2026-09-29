@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // FLEETVENV923: print the fleet venv PATH prefix ("<venv>/bin:", or nothing when
-// the setting is off or the directory is missing) for scripts/channels.sh.
+// the setting is off or the directory is missing) for the shell launchers,
+// through scripts/fleet-venv-prefix.sh.
 //
 // Resolved by the SAME functions the dashboard's launchers use
 // (dist/fleet-venv.js: store/config-overrides.json > .env > off, quotes
@@ -20,6 +21,6 @@ const { resolveFleetVenvDir, fleetVenvBin } = await import(join(projectRoot, 'di
 const venvDir = resolveFleetVenvDir(projectRoot)
 const { prefix, refused } = fleetVenvBin(venvDir)
 if (refused) {
-  process.stderr.write(`fleet-venv-prefix: FLEET_PYTHON_VENV (${venvDir}) contains a shell-active character; PATH prefix skipped\n`)
+  process.stderr.write(`fleet-venv-prefix: FLEET_PYTHON_VENV (${venvDir}) is not an absolute path or contains a shell-active character; PATH prefix skipped\n`)
 }
 process.stdout.write(prefix)
