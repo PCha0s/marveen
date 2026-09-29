@@ -7,8 +7,11 @@ import {
   resetSleepWakeDetectorForTest,
   SLEEP_GAP_THRESHOLD_MS,
   SLEEP_SAMPLE_INTERVAL_MS,
+  monotonicNowMs,
+  type ClockSample,
   type WakeEvent,
 } from '../web/sleep-wake-detector.js'
+import { decideCatchUpSummaryDelivery } from '../web/schedule-runner.js'
 
 // Tests for the machine sleep/wake detector (2026-09-02, kanban 83b8c4c3).
 //
@@ -20,26 +23,60 @@ import {
 
 afterEach(() => resetSleepWakeDetectorForTest())
 
+// Sample helpers: `asleep` = the wall clock moved, the monotonic clock did
+// not (host suspended); `stalled` = both moved together (event loop blocked).
+const at = (wallMs: number, monoMs: number): ClockSample => ({ wallMs, monoMs })
+
 describe('detectClockJump', () => {
   it('null previous sample (first ever sample) is never a jump', () => {
-    expect(detectClockJump(null, 1_000_000)).toBeNull()
+    expect(detectClockJump(null, at(1_000_000, 5_000))).toBeNull()
   })
 
   it('a normal sample cadence is not a jump', () => {
-    expect(detectClockJump(0, SLEEP_SAMPLE_INTERVAL_MS)).toBeNull()
+    expect(detectClockJump(at(0, 0), at(SLEEP_SAMPLE_INTERVAL_MS, SLEEP_SAMPLE_INTERVAL_MS))).toBeNull()
   })
 
-  it('event-loop jitter below the threshold is not a jump', () => {
-    expect(detectClockJump(0, SLEEP_GAP_THRESHOLD_MS - 1)).toBeNull()
+  it('a wall-over-monotonic divergence just below the threshold is not a jump', () => {
+    expect(detectClockJump(at(0, 0), at(SLEEP_GAP_THRESHOLD_MS - 1, 0))).toBeNull()
   })
 
-  it('a gap at the threshold is a jump spanning [prev, now]', () => {
-    const jump = detectClockJump(1000, 1000 + SLEEP_GAP_THRESHOLD_MS)
+  it('a divergence at the threshold (monotonic stood still: suspend) is a jump spanning [prev, now] on the wall clock', () => {
+    const jump = detectClockJump(at(1000, 7000), at(1000 + SLEEP_GAP_THRESHOLD_MS, 7000))
     expect(jump).toEqual({ sleepStartMs: 1000, wakeMs: 1000 + SLEEP_GAP_THRESHOLD_MS })
   })
 
   it('a BACKWARD clock step (NTP correction) is not sleep', () => {
-    expect(detectClockJump(1_000_000, 500_000)).toBeNull()
+    expect(detectClockJump(at(1_000_000, 0), at(500_000, 15_000))).toBeNull()
+  })
+
+  // #1153 review, measured: a 70 s event-loop stall on an awake machine gave
+  // wallMs 86001 = monoMs 86001, and the gap-only detector called it sleep.
+  it('STALL = LOUD: the review measurement (wall 86001 = mono 86001) is not sleep', () => {
+    expect(detectClockJump(at(0, 0), at(86_001, 86_001))).toBeNull()
+  })
+
+  it('STALL = LOUD: a stall of any length, both clocks together, is never sleep', () => {
+    for (const gap of [SLEEP_GAP_THRESHOLD_MS, 10 * 60_000, 6 * 3_600_000]) {
+      expect(detectClockJump(at(1000, 1000), at(1000 + gap, 1000 + gap))).toBeNull()
+    }
+  })
+
+  it('sleep followed by a stall in the same sample gap still counts the sleep part', () => {
+    // 2 h asleep (mono still) + 90 s stalled after the wake (both advance)
+    expect(detectClockJump(at(0, 0), at(2 * 3_600_000 + 90_000, 90_000))).not.toBeNull()
+  })
+
+  it('real clocks: a genuine synchronous stall moves wall and monotonic together', () => {
+    // A scaled-down replay of the review measurement on the real clocks: block
+    // the event loop, then judge the sample pair with a threshold the stall
+    // itself exceeds. A gap-only detector would call this sleep.
+    const stallMs = 250
+    const before = at(Date.now(), monotonicNowMs())
+    const until = monotonicNowMs() + stallMs
+    while (monotonicNowMs() < until) { /* busy-wait: the event loop is blocked */ }
+    const after = at(Date.now(), monotonicNowMs())
+    expect(after.wallMs - before.wallMs).toBeGreaterThanOrEqual(stallMs - 5)
+    expect(detectClockJump(before, after, stallMs - 50)).toBeNull()
   })
 })
 
@@ -73,7 +110,7 @@ describe('recordClockSample + systemSleptBetween (module state)', () => {
   it('regular sampling records nothing; systemSleptBetween stays false', () => {
     let t = 1_000_000
     for (let i = 0; i < 10; i++) {
-      expect(recordClockSample(t)).toBeNull()
+      expect(recordClockSample(t, t)).toBeNull()
       t += SLEEP_SAMPLE_INTERVAL_MS
     }
     expect(systemSleptBetween(1_000_000, t)).toBe(false)
@@ -81,11 +118,12 @@ describe('recordClockSample + systemSleptBetween (module state)', () => {
 
   it('a sleep gap between samples is recorded and queryable', () => {
     const HOUR = 3_600_000
-    recordClockSample(1_000_000)
-    recordClockSample(1_000_000 + SLEEP_SAMPLE_INTERVAL_MS)
-    // Lid closed for two hours.
+    const mono = 5_000
+    recordClockSample(1_000_000, mono)
+    recordClockSample(1_000_000 + SLEEP_SAMPLE_INTERVAL_MS, mono + SLEEP_SAMPLE_INTERVAL_MS)
+    // Lid closed for two hours: the wall clock moves on, the monotonic does not.
     const wakeAt = 1_000_000 + SLEEP_SAMPLE_INTERVAL_MS + 2 * HOUR
-    const jump = recordClockSample(wakeAt)
+    const jump = recordClockSample(wakeAt, mono + SLEEP_SAMPLE_INTERVAL_MS + 1)
     expect(jump).not.toBeNull()
     // The exact stuck-check shape: injectedAt just before the sleep, checked
     // just after the wake -- the window overlaps the gap.
@@ -97,6 +135,35 @@ describe('recordClockSample + systemSleptBetween (module state)', () => {
 
   it('with the detector never fed (webOnly / tests), every query is false', () => {
     expect(systemSleptBetween(0, Date.now())).toBe(false)
+  })
+
+  // STALL = LOUD, end to end through the module state and a consumer: after an
+  // in-process stall longer than the threshold, nothing is recorded, so the
+  // missed-schedule catch-up still goes to the channel (and the task-timeout /
+  // keepalive guards, which ask the same systemSleptBetween, stay loud).
+  it('STALL = LOUD: a 70 s event-loop stall records no event and the catch-up summary still reaches the channel', () => {
+    const t0 = 1_000_000
+    recordClockSample(t0, 40_000)
+    recordClockSample(t0 + SLEEP_SAMPLE_INTERVAL_MS, 40_000 + SLEEP_SAMPLE_INTERVAL_MS)
+    const stall = 70_000
+    const after = t0 + SLEEP_SAMPLE_INTERVAL_MS + stall
+    expect(recordClockSample(after, 40_000 + SLEEP_SAMPLE_INTERVAL_MS + stall)).toBeNull()
+    expect(systemSleptBetween(t0, after + 1000)).toBe(false)
+    expect(decideCatchUpSummaryDelivery(systemSleptBetween(t0, after + 1000))).toBe('channel')
+  })
+
+  it('...while the same gap with the monotonic clock standing still (sleep) is log-only', () => {
+    const t0 = 1_000_000
+    recordClockSample(t0, 40_000)
+    const after = t0 + 70_000
+    expect(recordClockSample(after, 40_000 + 5)).not.toBeNull()
+    expect(decideCatchUpSummaryDelivery(systemSleptBetween(t0, after + 1000))).toBe('log')
+  })
+
+  it('the live detector samples the real monotonic clock (process.hrtime.bigint)', () => {
+    const src = readFileSync(join(__dirname, '../web/sleep-wake-detector.ts'), 'utf-8')
+    expect(src).toContain('process.hrtime.bigint()')
+    expect(src).toMatch(/lastSample = \{ wallMs: Date\.now\(\), monoMs: monotonicNowMs\(\) \}/)
   })
 })
 
