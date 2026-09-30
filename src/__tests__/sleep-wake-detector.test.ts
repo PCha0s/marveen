@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
   detectClockJump,
   sleptInWindow,
@@ -8,8 +8,11 @@ import {
   SLEEP_GAP_THRESHOLD_MS,
   SLEEP_SAMPLE_INTERVAL_MS,
   monotonicNowMs,
+  parseWakeTime,
+  setWakeProbeForTest,
   type ClockSample,
   type WakeEvent,
+  type WakeProbe,
 } from '../web/sleep-wake-detector.js'
 import { decideCatchUpSummaryDelivery } from '../web/schedule-runner.js'
 
@@ -21,6 +24,9 @@ import { decideCatchUpSummaryDelivery } from '../web/schedule-runner.js'
 // power off) apart from a genuine hang while running. Suppressed: the
 // Telegram ping. Untouched: respawn / retry / kanban / log visibility.
 
+// Hermetic by default: a Linux-like probe, so no test reads the real host's
+// kern.waketime. The macOS cases below pass their own probe.
+beforeEach(() => setWakeProbeForTest({ platform: 'linux', lastWakeMs: () => null }))
 afterEach(() => resetSleepWakeDetectorForTest())
 
 // Sample helpers: `asleep` = the wall clock moved, the monotonic clock did
@@ -221,5 +227,78 @@ describe('fix-revert guard: alert paths are sleep-aware', () => {
     expect(respawnIdx).toBeGreaterThan(sleptIdx)
     const betweenGuardAndRespawn = fnBody.slice(fnBody.indexOf('if (!staleDueToSleep)'), respawnIdx)
     expect(betweenGuardAndRespawn).not.toMatch(/return/)
+  })
+})
+
+// --- macOS: the monotonic clock does NOT stop in sleep (#1153 review) ---
+//
+// libuv's uv_hrtime on macOS is mach_continuous_time(), which keeps counting
+// through sleep, so wall and monotonic advance together across a real sleep
+// exactly as across a freeze. There the proof of sleep is the host's last wake
+// time (kern.waketime), read only when a gap is seen.
+describe('macOS: a gap counts as sleep only when the host woke inside it', () => {
+  const T0 = 1_790_000_000_000
+  const gap = 86_001
+  const prev = at(T0, 5_000)
+  const nowSample = at(T0 + gap, 5_000 + gap) // mach_continuous_time: moved with the wall clock
+  const probe = (wake: number | null | (() => number | null)): WakeProbe & { calls: number } => {
+    const p = { platform: 'darwin', calls: 0, lastWakeMs: () => { p.calls++; return typeof wake === 'function' ? wake() : wake } }
+    return p
+  }
+
+  it('parseWakeTime reads the sysctl answer; sec = 0 (no sleep since boot) and garbage are unknown', () => {
+    // Format measured on the Mac mini (Darwin 27), kern.boottime / kern.waketime:
+    expect(parseWakeTime('{ sec = 1790664331, usec = 569763 } Tue Sep 29 08:45:31 2026\n')).toBe(1_790_664_331_569)
+    expect(parseWakeTime('{ sec = 0, usec = 0 } Thu Jan  1 01:00:00 1970')).toBeNull()
+    expect(parseWakeTime('')).toBeNull()
+    expect(parseWakeTime('sysctl: unknown oid')).toBeNull()
+  })
+
+  it('SLEEP: both clocks moved together, but the host woke inside the gap', () => {
+    expect(detectClockJump(prev, nowSample, SLEEP_GAP_THRESHOLD_MS, probe(T0 + gap - 2_000))).toEqual({ sleepStartMs: T0, wakeMs: T0 + gap })
+  })
+
+  it('STALL = LOUD on macOS: same clocks, but the last wake is before the gap', () => {
+    expect(detectClockJump(prev, nowSample, SLEEP_GAP_THRESHOLD_MS, probe(T0 - 3_600_000))).toBeNull()
+  })
+
+  it('unknown wake time (sec = 0, sysctl failed or threw) stays LOUD', () => {
+    expect(detectClockJump(prev, nowSample, SLEEP_GAP_THRESHOLD_MS, probe(null))).toBeNull()
+    expect(detectClockJump(prev, nowSample, SLEEP_GAP_THRESHOLD_MS, probe(() => { throw new Error('boom') }))).toBeNull()
+  })
+
+  it('a wake stamped slightly after the sample (NTP step) still belongs to the gap; far after does not', () => {
+    expect(detectClockJump(prev, nowSample, SLEEP_GAP_THRESHOLD_MS, probe(T0 + gap + 4_000))).not.toBeNull()
+    expect(detectClockJump(prev, nowSample, SLEEP_GAP_THRESHOLD_MS, probe(T0 + gap + 60_000))).toBeNull()
+  })
+
+  it('the wake time is read ONLY on a gap: normal 15 s samples never spawn sysctl', () => {
+    const p = probe(T0 + 1)
+    expect(detectClockJump(at(T0, 0), at(T0 + SLEEP_SAMPLE_INTERVAL_MS, SLEEP_SAMPLE_INTERVAL_MS), SLEEP_GAP_THRESHOLD_MS, p)).toBeNull()
+    expect(p.calls).toBe(0)
+  })
+
+  it('Linux never consults the wake probe: equal clocks across a gap are a stall there', () => {
+    const p = { ...probe(T0 + gap - 1), platform: 'linux' }
+    expect(detectClockJump(prev, nowSample, SLEEP_GAP_THRESHOLD_MS, p)).toBeNull()
+  })
+
+  it('end to end on macOS: a real-shaped sleep is log-only, a freeze of the same length reaches the channel', () => {
+    setWakeProbeForTest(probe(T0 + gap - 1_000))
+    recordClockSample(prev.wallMs, prev.monoMs)
+    expect(recordClockSample(nowSample.wallMs, nowSample.monoMs)).not.toBeNull()
+    expect(decideCatchUpSummaryDelivery(systemSleptBetween(T0, T0 + gap + 1_000))).toBe('log')
+
+    resetSleepWakeDetectorForTest()
+    setWakeProbeForTest(probe(T0 - 3_600_000))
+    recordClockSample(prev.wallMs, prev.monoMs)
+    expect(recordClockSample(nowSample.wallMs, nowSample.monoMs)).toBeNull()
+    expect(decideCatchUpSummaryDelivery(systemSleptBetween(T0, T0 + gap + 1_000))).toBe('channel')
+  })
+
+  it('the live probe reads kern.waketime through /usr/sbin/sysctl with a timeout', () => {
+    const src = readFileSync(join(__dirname, '../web/sleep-wake-detector.ts'), 'utf-8')
+    expect(src).toContain("execFileSync('/usr/sbin/sysctl', ['-n', 'kern.waketime'], { encoding: 'utf-8', timeout: 2000 })")
+    expect(src).not.toContain('mach_absolute_time on macOS')
   })
 })
