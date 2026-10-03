@@ -367,7 +367,21 @@ export function hookScriptAlreadyEffectiveInOtherScope(
 // than the CURRENT PROJECT_ROOT is rewritten to the current root. Suffixes,
 // not a remembered old root, are the detector, so it needs no migration
 // record and is idempotent: a second run finds nothing foreign.
-const INSTALL_ANCHORED_SUFFIXES = ['/store/.dashboard-token', '/scripts/hooks/', '/scripts/skill-index.sh'] as const
+//
+// Every install path the scaffold or the templates write into a CLAUDE.md or a
+// hook prompt must be listed here, or it keeps the old root after a move: the
+// recipient-ledger recipe and the skill-lint line were missing (HOSTMOVE1003,
+// found 2026-10-03 against the live fleet's CLAUDE.md files).
+// host-move-proof-recipes.test.ts pins the list against the source and the
+// templates. Exact file suffixes on purpose: a bare `/scripts/` or `/agents/`
+// would also match paths of other projects (or ~/.claude/agents/).
+export const INSTALL_ANCHORED_SUFFIXES = [
+  '/store/.dashboard-token',
+  '/scripts/hooks/',
+  '/scripts/skill-index.sh',
+  '/scripts/recipient-ledger.mjs',
+  '/scripts/skill-lint.mjs',
+] as const
 // An absolute path prefix: starts with a `/` that is not the tail of something
 // else (`~/x`, `{{X}}/x`, `a/x` are not absolute roots -- the lookbehind keeps
 // them out), runs until the suffix, and never crosses whitespace, quotes,
@@ -397,7 +411,10 @@ export function rewriteForeignProjectRoot(text: string, currentRoot: string): Fo
   const foreign = new Set<string>()
   let replaced = 0
   const out = text.replace(FOREIGN_ROOT_RE, (whole, prefix: string, suffix: string) => {
-    if (prefix === root) return whole
+    // A path INSIDE the current install is never foreign: the lazy prefix of
+    // <root>/agents/x/scripts/hooks/y is <root>/agents/x, which must not be
+    // "re-anchored" to <root>/scripts/hooks/y (HOSTMOVE1003).
+    if (prefix === root || prefix.startsWith(root + '/')) return whole
     foreign.add(prefix)
     replaced++
     return root + suffix
