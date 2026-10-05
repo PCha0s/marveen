@@ -71,6 +71,14 @@ RESPAWN_PLUGIN="${STUCK_MODAL_PLUGIN:-plugin:telegram@claude-plugins-official}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [$LOG_TAG] $*" || true; }
 
+# A file's mtime (epoch seconds), 0 when it is missing. GNU stat first, BSD
+# stat (macOS) second: the guard was systemd-only and used `stat -c %Y`, which
+# BSD stat rejects -- on a Mac every stamp then read as 0, so the shared
+# respawn grace and the backoff never held (MODELCONFIRM1005).
+file_mtime() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0
+}
+
 # --- pure classifier (mirrors src/pane-state.ts detectPaneState) ---------------
 # Reads a captured pane on stdin; prints one of: empty | busy | idle | stuck.
 classify_pane() {
@@ -243,7 +251,7 @@ run_guard() {
   fi
 
   if [ -f "$RESPAWN_STAMP" ]; then
-    local last; last="$(stat -c %Y "$RESPAWN_STAMP" 2>/dev/null || echo 0)"
+    local last; last="$(file_mtime "$RESPAWN_STAMP")"
     if [ $(( now - last )) -lt "$GRACE_SECONDS" ]; then
       log "Escape failed but a respawn happened $(( now - last ))s ago (< grace) -- deferring"
       return 0
@@ -253,7 +261,7 @@ run_guard() {
   case "$count" in (*[!0-9]*|'') count=0;; esac
   if [ "$count" -ge "$MAX_CONSECUTIVE" ]; then
     log "ALERT: stuck modal after $count respawns -- backing off, manual check needed"
-    local bstamp=0; [ -f "$BACKOFF_STAMP" ] && bstamp="$(stat -c %Y "$BACKOFF_STAMP" 2>/dev/null || echo 0)"
+    local bstamp=0; [ -f "$BACKOFF_STAMP" ] && bstamp="$(file_mtime "$BACKOFF_STAMP")"
     if [ $(( now - bstamp )) -ge 3600 ]; then
       # Backoff stamp ONLY on confirmed delivery (NOTIFYVAKSWEEP826): this is
       # the "your messages may be lost, resend" alert -- burying its own
@@ -356,6 +364,7 @@ case "${1:-}" in
   classify)       classify_pane ;;
   decide)         decide_action "${2:-}" "${3:-0}" "${4:-0}" ;;
   sanitize-model) sanitize_model "${2:-}" ;;
+  mtime)          file_mtime "${2:-}" ;;
   # Test-only seam (scripts/__tests__/stuck-modal-guard.test.sh, CHATID0): exercise
   # alert_owner's real owner-chat resolution without driving the full pane flow.
   alert-owner-test) alert_owner "${2:-probe}" ;;

@@ -1576,6 +1576,19 @@ if [ -x "$INSTALL_DIR/scripts/install-channel-keepalive-probe.sh" ]; then
   fi
 fi
 
+# Stuck-modal guard, the launchd twin of the systemd timer Linux has had since
+# #937. A modal left open in the main session (a /mcp dialog after a full disk,
+# the CLI's "Switch model?" after a /model -- measured 2026-10-05, half an hour
+# of queued Telegram messages) blocks every inbound message, and on macOS no
+# job of any guard existed to close it. Non-fatal, like the probe above.
+if [ -x "$INSTALL_DIR/scripts/install-stuck-modal-guard.sh" ]; then
+  if "$INSTALL_DIR/scripts/install-stuck-modal-guard.sh" --load >/dev/null 2>&1; then
+    ok "Beragadt-ablak or telepitve (percenkent, a fo session felugro ablakai ellen)"
+  else
+    warn "A beragadt-ablak or telepitese nem sikerult -- inditsd kezzel: scripts/install-stuck-modal-guard.sh --load"
+  fi
+fi
+
 # Main-agent inbox observer, installed the same way and for the same reason: a
 # probe nobody schedules is not a probe. Every delivery path except the main
 # agent's queue is watched by something, and the one in-process reader of that

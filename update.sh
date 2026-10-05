@@ -741,6 +741,30 @@ install_keepalive_probe_launchd() {
   return 0
 }
 
+# The stuck-modal guard's launchd twin on Macs that are already installed
+# (MODELCONFIRM1005), the same way and for the same reason as the probe above:
+# install-macos.sh only reaches NEW installs. Measured 2026-10-05 on the Mac
+# mini: the CLI's "Switch model?" dialog held the main session for half an hour
+# and launchctl had no job of any modal guard. Idempotent: once the plist exists
+# this writes nothing and prints nothing; the label is read from the installer.
+install_stuck_modal_guard_launchd() {
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+  _sm_installer="$INSTALL_DIR/scripts/install-stuck-modal-guard.sh"
+  [ -x "$_sm_installer" ] || return 0
+  command -v launchctl >/dev/null 2>&1 || return 0
+  _sm_label="$(sed -n 's/^LABEL="\(.*\)"$/\1/p' "$_sm_installer" | head -1)"
+  [ -n "$_sm_label" ] || _sm_label="com.marveen.stuck-modal-guard"
+  if [ -f "$HOME/Library/LaunchAgents/${_sm_label}.plist" ]; then
+    return 0
+  fi
+  if "$_sm_installer" --load >/dev/null 2>&1; then
+    echo -e "  Beragadt-ablak or telepitve (percenkent, a fo session felugro ablakai ellen): ${_sm_label}"
+  else
+    echo -e "  FIGYELEM: a beragadt-ablak or telepitese nem sikerult -- inditsd kezzel: scripts/install-stuck-modal-guard.sh --load"
+  fi
+  return 0
+}
+
 # Morning-timer parking (MORNTIMERPARK914 -- the missing half of the locked
 # MORNCONS1 decision, 2026-07-27). The #1313 installer change stops ENABLING
 # the 07:27 morning timer on NEW installs, but every already-installed Linux
@@ -922,6 +946,7 @@ run_unit_maintenance() {
   migrate_channels_restart "$@"
   install_keepalive_probe_timer "$@"
   install_keepalive_probe_launchd "$@"
+  install_stuck_modal_guard_launchd "$@"
   install_main_inbox_observer_unit "$@"
   strip_legacy_notifier_telegram_env "$@"
   park_morning_timer "$@"

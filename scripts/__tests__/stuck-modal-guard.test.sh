@@ -186,6 +186,35 @@ fi
 rm -rf "$GBASE"
 
 # ---------------------------------------------------------------------------
+# (h) MODELCONFIRM1005 -- macOS
+# ---------------------------------------------------------------------------
+echo ""
+echo "(h) macOS: the Switch-model dialog is stuck, mtime is portable"
+
+# The pane exactly as captured from the live main session on 2026-10-05: the
+# CLI's confirmation after a /model. No idle footer, no live turn -> stuck, so
+# the guard (now also scheduled on macOS) would close it.
+SWITCH_MODEL='← telegram · 7380188614: Itt vagy?
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+   Switch model?
+   Your next response will be slower and use more tokens
+   This conversation is cached for the current model. Switching to Sonnet 5.5
+   means the full history gets re-read on your next message.
+   ❯ 1. Yes, switch to Sonnet 5.5
+     2. No, go back'
+assert_eq "the Switch-model confirmation classifies as stuck" "stuck" "$(classify "$SWITCH_MODEL")"
+
+# `stat -c %Y` is GNU-only; on macOS it failed and every stamp read as 0, so
+# the shared respawn grace and the backoff never held. The helper must give
+# the real mtime on both, and 0 for a missing file.
+MT_DIR="$(mktemp -d)"
+TZ=UTC touch -t 202610050419.35 "$MT_DIR/stamp"
+assert_eq "mtime: the real epoch of a stamp (GNU or BSD stat)" "1791173975" "$(bash "$GUARD" mtime "$MT_DIR/stamp")"
+assert_eq "mtime: a missing file is 0" "0" "$(bash "$GUARD" mtime "$MT_DIR/nope")"
+assert_eq "no GNU-only 'stat -c' call is left outside the helper" "1" "$(grep -cE '^[^#]*stat -c' "$GUARD" | tr -d ' ')"
+rm -rf "$MT_DIR"
+
+# ---------------------------------------------------------------------------
 echo ""
 echo "======================="
 TOTAL=$((PASS + FAIL))
