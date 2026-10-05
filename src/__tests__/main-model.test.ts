@@ -537,6 +537,28 @@ describe('MODELCONFIRM1005: the CLI\'s "Switch model?" confirmation is answered,
     expect(modelSwitchConfirmOpen('   Switch model?\n   2. No, go back\n')).toBe(false) // no "1. Yes, switch to"
     expect(modelSwitchConfirmOpen('❯ 1. Yes, switch to Opus\n')).toBe(false) // no title
     expect(modelSwitchConfirmOpen(null)).toBe(false)
+    // #1694 review survivor: the title alone is not enough, option 1 must be THE switch
+    expect(modelSwitchConfirmOpen('   Switch model?\n   ❯ 1. Keep the current model\n     2. Cancel\n')).toBe(false)
+  })
+
+  it('a late dialog gets a FRESH ack window after the answer (#1694 review survivor)', async () => {
+    // Fake clock: the dialog shows up 2.5 s into the 3 s ack window, and the
+    // CLI acknowledges 1.5 s after the "1" -- beyond the original window. Without
+    // the fresh window the reply would be the cautious "elküldve".
+    writeChoices()
+    let t = 0
+    let answeredAt: number | null = null
+    let acks = 0
+    const d = deps({
+      sleep: async (ms) => { t += ms },
+      send: async (c) => { d.sent.push(c) },
+      pane: () => (answeredAt === null && t >= 2500 ? CONFIRM_DIALOG : 'idle\n'),
+      key: async (k) => { d.keys.push(k); answeredAt = t },
+      ackCount: () => acks + (answeredAt !== null && t >= answeredAt + 1500 ? 1 : 0),
+    })
+    const r = await setModel(['opus'], d)
+    expect(d.keys).toEqual(['1'])
+    expect(r.text).toMatch(/^Átváltva: opus\./)
   })
 
   it('setModel: the dialog opens, "1" is typed once, the switch is acknowledged and kept', async () => {

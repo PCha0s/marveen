@@ -18,9 +18,12 @@
 #                          i.e. at least two consecutive observations)
 #   AccuracySec=10s     -> no launchd equivalent
 #
-# The guard's own safety rules are unchanged: a working (busy) or idle pane is
-# never touched, recovery is Escape first and a respawn only after that fails,
-# and the respawn shares channel-watchdog.sh's grace stamp.
+# Installing it does NOT turn automatic recovery on (#1694 review, the
+# maintainers' opt-in rule): the guard's default STUCK_MODAL_MODE is log -- it
+# detects a stuck main pane and logs it once per episode. STUCK_MODAL_MODE=alert
+# in .env adds one owner alert per episode; only STUCK_MODAL_MODE=act sends
+# Escape and, if that fails, respawns (a working or idle pane is never touched,
+# and the respawn shares channel-watchdog.sh's grace stamp).
 #
 # Usage:
 #   scripts/install-stuck-modal-guard.sh            # install, do not start
@@ -86,7 +89,7 @@ echo "Wrote launchd unit: $PLIST"
 if [ "$LOAD" = "1" ]; then
   launchctl unload "$PLIST" 2>/dev/null || true
   launchctl load "$PLIST"
-  echo "Loaded $LABEL (every 60s + at load). It only acts on a main-session pane that stays stuck (no idle footer, no live turn) for STUCK_MODAL_SECONDS: Escape first, respawn only if that fails."
+  echo "Loaded $LABEL (every 60s + at load). Default STUCK_MODAL_MODE=log: it detects and logs a stuck main pane, nothing else. alert adds an owner alert; act enables Escape + respawn."
 else
   echo "Installed but NOT loaded. To start: launchctl load $PLIST"
 fi

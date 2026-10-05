@@ -745,20 +745,30 @@ install_keepalive_probe_launchd() {
 # (MODELCONFIRM1005), the same way and for the same reason as the probe above:
 # install-macos.sh only reaches NEW installs. Measured 2026-10-05 on the Mac
 # mini: the CLI's "Switch model?" dialog held the main session for half an hour
-# and launchctl had no job of any modal guard. Idempotent: once the plist exists
-# this writes nothing and prints nothing; the label is read from the installer.
+# and launchctl had no job of any modal guard. The guard's default mode is
+# log-only (STUCK_MODAL_MODE, see stuck-modal-guard.sh): it detects and logs,
+# recovery is opt-in. #1694 review:
+#   - keyed on the job being LOADED, not on the plist existing: a plist left by
+#     a failed `launchctl load` is retried (and reported) on every run instead of
+#     going quiet forever;
+#   - STUCK_MODAL_MODE=off in .env is the opt-out, and it survives updates: no
+#     install, no load.
+# Idempotent: with the job loaded this writes nothing and prints nothing; the
+# label is read from the installer.
 install_stuck_modal_guard_launchd() {
   [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
   _sm_installer="$INSTALL_DIR/scripts/install-stuck-modal-guard.sh"
   [ -x "$_sm_installer" ] || return 0
   command -v launchctl >/dev/null 2>&1 || return 0
+  _sm_mode="$(grep -E '^STUCK_MODAL_MODE=' "$INSTALL_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"'\r ' | tr '[:upper:]' '[:lower:]')"
+  [ "$_sm_mode" = "off" ] && return 0
   _sm_label="$(sed -n 's/^LABEL="\(.*\)"$/\1/p' "$_sm_installer" | head -1)"
   [ -n "$_sm_label" ] || _sm_label="com.marveen.stuck-modal-guard"
-  if [ -f "$HOME/Library/LaunchAgents/${_sm_label}.plist" ]; then
+  if launchctl list "$_sm_label" >/dev/null 2>&1; then
     return 0
   fi
   if "$_sm_installer" --load >/dev/null 2>&1; then
-    echo -e "  Beragadt-ablak or telepitve (percenkent, a fo session felugro ablakai ellen): ${_sm_label}"
+    echo -e "  Beragadt-ablak or telepitve (percenkent; alapbol csak naploz, STUCK_MODAL_MODE): ${_sm_label}"
   else
     echo -e "  FIGYELEM: a beragadt-ablak or telepitese nem sikerult -- inditsd kezzel: scripts/install-stuck-modal-guard.sh --load"
   fi
