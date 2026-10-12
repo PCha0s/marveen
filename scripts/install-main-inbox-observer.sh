@@ -29,7 +29,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-LABEL="com.marveen.main-inbox-observer"
+# #1873: com.<SERVICE_ID>.main-inbox-observer, not a fixed com.marveen.main-inbox-observer -- two installs
+# under one user must not share (and overwrite) one helper job.
+. "$SCRIPT_DIR/launchd-label.sh"
+LABEL="$(helper_launchd_label "$PROJECT_DIR" main-inbox-observer)"
+# update.sh asks the installer for the label instead of grepping a fixed one.
+if [ "${1:-}" = "--print-label" ]; then printf '%s\n' "$LABEL"; exit 0; fi
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 OBSERVER="$PROJECT_DIR/scripts/main-inbox-observer.sh"
 
@@ -56,6 +61,7 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 mkdir -p "$HOME/Library/LaunchAgents"
+retire_legacy_helper_label "$PROJECT_DIR" main-inbox-observer "$LABEL" "$HOME/Library/LaunchAgents"
 cat > "$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -97,7 +103,7 @@ echo "Wrote launchd unit: $PLIST"
 if [ "$LOAD" = "1" ]; then
   launchctl unload "$PLIST" 2>/dev/null || true
   launchctl load "$PLIST"
-  echo "Loaded $LABEL (every 300s + at load). It reads the queue with sqlite3 -readonly and alerts over the direct Bot API, so it keeps working while the dashboard process is down."
+  echo "Loaded $LABEL (every 300s + at load). It reads the queue read-only (python3 sqlite3) and alerts over the direct Bot API, so it keeps working while the dashboard process is down."
   echo "Liveness is measurable from outside: store/.main-inbox-observer is rewritten on every tick."
 else
   echo "Installed but NOT loaded. To start: launchctl load $PLIST"

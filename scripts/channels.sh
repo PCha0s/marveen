@@ -19,6 +19,45 @@
 
 INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# WHO THE GUARD ALERTS IN THIS SCRIPT ARE SENT AS.
+#
+# The two alerts below report that the main agent came up on the SHARED
+# ~/.claude, which can 401 into a silent channel -- so an alert that cannot be
+# delivered defeats its own purpose. Measured 2026-09-26 against the live
+# dashboard: `from=channels-sh-guard` is answered HTTP 403 "unknown agent",
+# while the install's MAIN_AGENT_ID is accepted. The sender check
+# (src/web/routes/messages.ts) takes the owner, an id listed in
+# SYSTEM_SENDER_IDS, the voice channel, or a directory under agents/ --
+# SYSTEM_SENDER_IDS is EMPTY by default (src/config.ts) and no
+# agents/channels-sh-guard/ directory exists. Same defect and same fix as the
+# prod-tree-guard hook (card ecb62920 closed the identical shape for
+# `from=marveen`).
+#
+# SCOPE, SAID OUT LOUD: no alert has been lost to this on this install.
+# store/channels-failures.log has zero "starting on SHARED" lines, so the
+# trigger has never fired here. This is prevention, not a post-mortem.
+_guard_sender() {
+  # The SAME normalisation the server applies, so this can never pick a
+  # spelling the API then refuses: parseSystemSenderIds (src/config.ts) splits
+  # on commas and trims, sanitizeAgentIdent (src/prompt-safety.ts) drops every
+  # character outside [A-Za-z0-9_-]. Case is significant there, so it is here.
+  local want="channels-sh-guard" entry saved_ifs
+  saved_ifs="$IFS"
+  IFS=','
+  for entry in ${SYSTEM_SENDER_IDS:-}; do
+    entry="$(printf '%s' "$entry" | tr -dc 'A-Za-z0-9_-')"
+    if [ "$entry" = "$want" ]; then
+      IFS="$saved_ifs"
+      printf '%s' "$want"
+      return 0
+    fi
+  done
+  IFS="$saved_ifs"
+  # Not registered here: the id the API does accept. This mirrors the recipient
+  # on the same two calls, which already resolves this way.
+  printf '%s' "${MAIN_AGENT_ID:-marveen}"
+}
+
 # Read MAIN_AGENT_ID and CHANNEL_PROVIDER from .env WITHOUT exporting
 # every variable into the shell environment. `set -a && source .env`
 # would also export TELEGRAM_BOT_TOKEN, which then leaks into the tmux
@@ -27,6 +66,11 @@ INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # token and fight over the same getUpdates slot, 409 Conflict in a loop.
 if [ -f "$INSTALL_DIR/.env" ]; then
   MAIN_AGENT_ID="$(grep -E '^MAIN_AGENT_ID=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
+  # Read for _guard_sender() below: it decides whether this script's guard
+  # alerts may be sent under the guard's own name or must use the main agent's
+  # id. Same read shape as the keys around it, and NOT exported, for the reason
+  # the comment above gives.
+  SYSTEM_SENDER_IDS="$(grep -E '^SYSTEM_SENDER_IDS=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
   CHANNEL_PROVIDER="$(grep -E '^CHANNEL_PROVIDER=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
   BOT_NAME="$(grep -E '^BOT_NAME=' "$INSTALL_DIR/.env" | head -1 | cut -d= -f2-)"
   # Optional extra channel plugins to co-listen alongside the PRIMARY provider
@@ -120,7 +164,34 @@ classify_mcp_plugin_row() {
 #
 # Kept as a function so `--resolve-main-model` can exercise exactly the code
 # the launch path uses, with no tmux, store or network involved.
+# SECSZIVEK1007: a value as ONE single-quoted shell word, the bash twin of
+# shSingleQuote (src/web/agent-process.ts): a quote in the value becomes '\'',
+# so nothing in it can end the word. Used for every value inlined into a
+# command string that a later shell (tmux respawn) parses again. The same
+# definition lives in channels.sh, channel-watchdog.sh and stuck-modal-guard.sh
+# (a test keeps the three byte-identical).
+sh_single_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# SECSZIVEK1007: the resolved model must have the shape of a model id (the same
+# allowlist as MODEL_ID_RE in src/model-id.ts: letters, digits, . _ : / - [ ],
+# 1-128 long). Any other value is named in the failure log (not echoed) and
+# left UNSET, so the launch runs the CLI default instead of a broken command.
+MODEL_ID_SHAPE='^[][A-Za-z0-9._:/-]{1,128}$'
 resolve_main_model() {
+  local _m
+  _m="$(_resolve_main_model_raw)"
+  # C locale for the match: a bracket range like A-Z is locale-dependent in
+  # some bash/libc builds; under C it is exactly the ASCII set MODEL_ID_RE means
+  # (model-id-shape-parity.test.ts compares the two under C).
+  local LC_ALL=C
+  if [ -n "$_m" ] && ! [[ "$_m" =~ $MODEL_ID_SHAPE ]]; then
+    { echo "resolve_main_model: the configured main-agent model is not a valid model id (allowed: letters, digits, . _ : / - [ ], 1-128); main-agent model left UNSET" >>"$INSTALL_DIR/store/channels-failures.log"; } 2>/dev/null || true
+    return 0
+  fi
+  printf '%s' "$_m"
+}
+
+_resolve_main_model_raw() {
   if [ -n "${MAIN_AGENT_MODEL:-}" ]; then
     printf '%s' "$MAIN_AGENT_MODEL"
     return 0
@@ -178,12 +249,65 @@ resolve_main_model() {
     echo "resolve_main_model: dist/config-registry.js missing (build not present yet?); main-agent model left UNSET" >>"$_fail_log" 2>/dev/null || true
     return 0
   fi
-  local _def
-  _def="$("$_node" -e 'try { process.stdout.write(String(require(process.argv[1]).DISTRIBUTION_DEFAULT_AGENT_MODEL || "")) } catch (e) { process.exit(3) }' "$INSTALL_DIR/dist/config-registry.js" 2>/dev/null)"
+  # DEFAULTCLIGUARD927: the shipped default is guarded against the INSTALLED
+  # CLI, through the same table and decision the dashboard uses
+  # (dist/claude-cli-support.js launchableDefaultModel; the TS twin is
+  # readConfiguredMainModel, and main-model-resolution-parity.test.ts keeps the
+  # two equal). An AVX-less host is pinned to CLI 2.1.112 (CLAUDE_PIN below;
+  # 2.1.110 before #1494) and DISABLE_AUTOUPDATER keeps any older CLI in place, so a default that
+  # CLI cannot run would bring the session up and 400 every prompt -- a silent
+  # bot. On a CLI measured too old, the previous tier
+  # (DISTRIBUTION_DEFAULT_FALLBACK_MODEL) launches instead, with a named line.
+  # Fail-open: an unmeasurable version, or a dist without the guard, keeps the
+  # default (the latter is named too). MARVEEN_CLAUDE_CLI_VERSION overrides the
+  # probe exactly as on the TS side (empty = unmeasured).
+  # The probe needs the SAME binary the launch runs. The watchdogs call this
+  # seam under a narrow launchd PATH, so after PATH try the dirs the TS side
+  # probes (platform.ts KNOWN_BIN_DIRS); a miss is unmeasured = fail-open.
+  local _claude="${CLAUDE:-}"
+  [ -z "$_claude" ] && _claude="$(command -v claude 2>/dev/null || true)"
+  if [ -z "$_claude" ]; then
+    for _c in "$HOME/.local/bin/claude" "$HOME/.bun/bin/claude" /opt/homebrew/bin/claude /usr/local/bin/claude /usr/bin/claude /bin/claude; do
+      [ -x "$_c" ] && { _claude="$_c"; break; }
+    done
+  fi
+  local _res _def _note=""
+  _res="$("$_node" -e '
+    let reg
+    try { reg = require(process.argv[1]) } catch (e) { process.exit(3) }
+    const def = String(reg.DISTRIBUTION_DEFAULT_AGENT_MODEL || "")
+    if (!def) process.exit(0)
+    let model = def, note = ""
+    try {
+      const sup = require(process.argv[2])
+      const fallback = String(reg.DISTRIBUTION_DEFAULT_FALLBACK_MODEL || "")
+      if (!fallback || typeof sup.launchableDefaultModel !== "function") throw new Error("no guard")
+      let ver = null
+      if (process.env.MARVEEN_CLAUDE_CLI_VERSION !== undefined) {
+        ver = sup.parseClaudeVersion(process.env.MARVEEN_CLAUDE_CLI_VERSION)
+      } else if (process.argv[3]) {
+        try {
+          ver = sup.parseClaudeVersion(require("node:child_process").execFileSync(process.argv[3], ["--version"],
+            { encoding: "utf-8", timeout: 10000, stdio: ["ignore", "pipe", "ignore"] }))
+        } catch (e) { ver = null }
+      }
+      const d = sup.launchableDefaultModel(def, fallback, ver)
+      model = d.model
+      if (d.replaced) note = "DEFAULTCLIGUARD927: installed Claude Code " + ver + " cannot launch the distribution default " + d.replaced + " (needs >= " + d.minCli + "); main agent launches " + d.model
+    } catch (e) {
+      note = "DEFAULTCLIGUARD927: guard unavailable (stale dist/claude-cli-support.js or config-registry.js); distribution default " + def + " used unguarded"
+    }
+    process.stdout.write(model + "\n" + note)
+  ' "$INSTALL_DIR/dist/config-registry.js" "$INSTALL_DIR/dist/claude-cli-support.js" "$_claude" 2>/dev/null)"
+  _def="${_res%%$'\n'*}"
+  case "$_res" in *$'\n'*) _note="${_res#*$'\n'}" ;; esac
   if [ -z "$_def" ]; then
     echo "resolve_main_model: read of DISTRIBUTION_DEFAULT_AGENT_MODEL was empty (stale or broken dist/config-registry.js); main-agent model left UNSET" >>"$_fail_log" 2>/dev/null || true
     return 0
   fi
+  # The group's own 2>/dev/null: a >> into a missing store/ fails BEFORE an
+  # inner 2>/dev/null takes effect, and would print into the caller's stderr.
+  [ -n "$_note" ] && { { echo "resolve_main_model: $_note" >>"$_fail_log"; } 2>/dev/null || true; }
   printf '%s' "$_def"
 }
 
@@ -206,7 +330,7 @@ fi
 # Returns 0 (dead) only on a positive `1` from tmux; a failed query is NOT dead
 # (fail-safe: never restart on a broken instrument).
 pane_dead_detected() {
-  "$TMUX" list-panes -t "$1" -F '#{pane_dead}' 2>/dev/null | grep -q '^1$'
+  "$TMUX" list-panes -t "=$1:" -F '#{pane_dead}' 2>/dev/null | grep -q '^1$'
 }
 
 # Test seam: `channels.sh --pane-dead-check <session>` prints dead|alive and
@@ -217,6 +341,28 @@ if [ "${1:-}" = "--pane-dead-check" ]; then
   TMUX="${CHANNELS_TMUX_BIN:-$(command -v tmux)}"
   if pane_dead_detected "${2:-}"; then echo dead; else echo alive; fi
   exit 0
+fi
+
+# BOOTSTAGGER1007 (a): wait for the channel hosts to resolve before the main
+# session starts (see scripts/lib/channel-net-wait.sh for the measured boot).
+# shellcheck source=lib/channel-net-wait.sh
+. "$INSTALL_DIR/scripts/lib/channel-net-wait.sh"
+
+# Test seams, exiting before the store or a session is touched:
+#   --channel-wait-hosts <primary> [extra plugin ids...]  prints the hosts the
+#     launch below waits for (one per line);
+#   --channel-net-wait <host...>  runs the wait itself, exit 0 = all resolved,
+#     1 = gave up (CHANNEL_DNS_PROBE / CHANNEL_NET_WAIT_* steer it in tests).
+# See scripts/__tests__/channels-net-wait.test.sh.
+if [ "${1:-}" = "--channel-wait-hosts" ]; then
+  shift
+  channel_wait_hosts "$@"
+  exit 0
+fi
+if [ "${1:-}" = "--channel-net-wait" ]; then
+  shift
+  wait_for_channel_hosts "$@"
+  exit $?
 fi
 
 # CHANSPARE925: is the process that owns bot.pid OURS? Measured 2026-09-25: a
@@ -359,6 +505,12 @@ fi
 CHANNELS_EXITS_LOG="${CHANNELS_EXITS_LOG:-$INSTALL_DIR/store/channels-exits.log}"
 record_channels_exit() {
   _rc="$1"
+  # LAUNCHGATE1008: a gate refusal from a checkout that is not an install (no store/)
+  # has already said why on stderr; the exit row would only add two failure lines.
+  # Every other exit keeps the loud "exit-log write FAILED" below.
+  if [ -n "${LAUNCHGATE_REFUSED:-}" ] && [ ! -d "$(dirname "$CHANNELS_EXITS_LOG")" ]; then
+    return 0
+  fi
   echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh exit code=${_rc} line=${CHEXIT_LAST_LINE:-?} cmd=[${CHEXIT_LAST_CMD:-?}] pid=$$" >> "$CHANNELS_EXITS_LOG" 2>/dev/null \
     || echo "channels.sh: exit-log write FAILED (code=${_rc} line=${CHEXIT_LAST_LINE:-?} target=$CHANNELS_EXITS_LOG)" >&2
 }
@@ -397,6 +549,39 @@ trap 'record_channels_exit "$?"' EXIT
 if [ "${1:-}" = "--exit-probe" ]; then
   exit "${2:-0}"
 fi
+
+# LAUNCHGATE1008: the launch boundary. Every seam above exits before it gets here,
+# and nothing above starts tmux, claude or a kill. From the next line on, this
+# script LAUNCHES the main channel session. Two shapes used to fall through to a
+# real launch:
+#   - an argument this version does not know (a test calling a seam that only a
+#     newer channels.sh has): it launched a second session on the live tmux
+#     server, i.e. a second getUpdates poller on the owner's bot -> 409, the live
+#     channel deaf until a restart;
+#   - a checkout without .env (a worktree, a fixture): it launched under the
+#     guessed name "marveen-channels" with the shared channel state.
+# Both stop here, loudly, with nothing started. No argument and a lone `restart`
+# (the documented manual restart in the installers' hint) launch as before; any
+# extra argument is refused too ($# is checked, not only $1). A .env without
+# MAIN_AGENT_ID keeps the old "marveen" default (older installs).
+# Behaviour changes, on purpose:
+#   - an env-only setup (MAIN_AGENT_ID exported, no .env file) no longer launches;
+#   - an install whose .env is missing now exits 3 on every start, so a supervisor
+#     restarts it at its own cadence (systemd up to its start limit, launchd about
+#     every 30 s) instead of running a guessed session.
+# A new test seam must be added ABOVE this gate: below it, it gets exit 2.
+case "$#:${1:-}" in
+  "0:"|"1:restart") : ;;
+  *) printf 'channels.sh: unknown argument(s) %q -- nothing started (LAUNCHGATE1008)\n' "$*" >&2
+     LAUNCHGATE_REFUSED=1
+     exit 2 ;;
+esac
+if [ ! -f "$INSTALL_DIR/.env" ]; then
+  echo "channels.sh: no $INSTALL_DIR/.env -- this checkout is not an install, nothing started (LAUNCHGATE1008)" >&2
+  LAUNCHGATE_REFUSED=1
+  exit 3
+fi
+# LAUNCHGATE1008-END: everything below launches.
 
 # Self-healing guard: ensure PLUGIN_ID is enabled in the PROJECT settings.json
 # before launch. A PR review-reset or branch-switch that reverts
@@ -477,6 +662,11 @@ for _p in $CHANNEL_PLUGINS_EXTRA; do
   [ -n "$_p" ] && EXTRA_CHANNELS="$EXTRA_CHANNELS plugin:$_p"
 done
 unset _p
+# SLACKDMVESZT1006: enable the extras for THIS session only, via a --settings
+# file (see the helper's header for why not a settings layer).
+. "$INSTALL_DIR/scripts/main-extra-plugins-settings.sh"
+# shellcheck disable=SC2086 # word-split on purpose: space-separated plugin ids
+EXTRA_SETTINGS_FLAG="$(main_extra_settings_flag "$INSTALL_DIR" $CHANNEL_PLUGINS_EXTRA)"
 
 # ROOT-CAUSE NOTE (kali-linux WSL, claude-code 2.1.152, 2026-05-27):
 # Inbound MCP notifications from the `--channels` plugin go through a SECOND
@@ -513,6 +703,20 @@ unset TMUX
 
 export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
+# FLEETVENV923: the fleet Python venv's bin/ goes FIRST, when it is set and
+# exists, so the main session's `python3` (and markitdown & co.) come from the
+# venv -- parity with startAgentProcess (sub-agents) and the channel-monitor
+# recovery relaunch. Resolved by scripts/fleet-venv-prefix.mjs through the SAME
+# functions those launchers use (dist/fleet-venv.js: Settings-page override >
+# .env > off). A grep/cut parse here disagreed with them on a quoted value, an
+# empty value and a Settings-page override (#1626 review). No node or no dist
+# yet = no prefix, and the reason is named in channels-failures.log.
+mkdir -p "$INSTALL_DIR/store" 2>/dev/null || true
+. "$INSTALL_DIR/scripts/fleet-venv-prefix.sh" 2>/dev/null || fleet_venv_prefix() { :; }
+FLEET_VENV_PREFIX="$(fleet_venv_prefix "$INSTALL_DIR" "$INSTALL_DIR/store/channels-failures.log")"
+[ -n "$FLEET_VENV_PREFIX" ] && export PATH="$FLEET_VENV_PREFIX$PATH"
+# /FLEETVENV923
+
 # Root VPS / container: Claude Code refuses --dangerously-skip-permissions when
 # running as uid 0 ("cannot be used with root/sudo privileges"), so the tmux
 # claude session below dies instantly and the bot never comes online. On a
@@ -526,7 +730,7 @@ export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HO
 # first run, killing every session. Recorded here because it also decides WHICH
 # package spec the self-heal below reinstalls: on such a host "latest" is the
 # one thing we must never install.
-CLAUDE_PIN="2.1.110"   # keep in sync with install-linux.sh / scripts/fix-avx.sh
+CLAUDE_PIN="2.1.112"   # keep in sync with install-linux.sh / scripts/fix-avx.sh
 CLAUDE_PKG="@anthropic-ai/claude-code"
 AVX_LESS=0
 if grep -qE '^flags[[:space:]]*:' /proc/cpuinfo 2>/dev/null && ! grep -qiw avx /proc/cpuinfo 2>/dev/null; then
@@ -612,8 +816,114 @@ claude_install() {
   fi
 }
 
+# NATIVE-INSTALL HOSTS: never touch npm.
+#
+# A host that moved to Anthropic's native installer runs
+# ~/.local/bin/claude -> ~/.local/share/claude/versions/<v>. The daily check
+# below used to run `npm install -g` unconditionally, which RE-CREATES a
+# second, independent claude under the npm global prefix on a host that had
+# already migrated away from it. Measured 2026-09-17: the daily check
+# reinstalled the npm copy (2.1.274) while the fleet ran native 2.1.265, and
+# the main session then came up on the npm copy -- two versions of claude on
+# one machine, the same second-install vector that broke the install four
+# times in one day in July.
+#
+# Auto-updating the native install from here is ALSO off, on purpose:
+# `claude update` on a native install can misdetect itself as npm-global and
+# reinstall the npm package, re-creating the very second install this block
+# prevents. Upgrading a native build is a deliberate step (`claude install
+# stable`), not a side effect of a boot.
+CLAUDE_NATIVE_ROOT="$HOME/.local/share/claude/versions"
+claude_realpath() {
+  python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null \
+    || readlink -f "$1" 2>/dev/null
+}
+claude_is_native() {
+  local b t root
+  b="$(command -v claude 2>/dev/null)" || return 1
+  [ -n "$b" ] || return 1
+  t="$(claude_realpath "$b")" || return 1
+  # Resolve the root too: HOME itself may sit behind a symlink (macOS /var ->
+  # /private/var), and a resolved target never matches an unresolved prefix.
+  root="$(claude_realpath "$CLAUDE_NATIVE_ROOT")" || return 1
+  [ -n "$t" ] && [ -n "$root" ] || return 1
+  case "$t" in
+    "$root"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Self-heal for a native host whose LAUNCHER broke while the versioned
+# binaries are still on disk: re-link to the newest one instead of falling
+# back to npm, which would reintroduce the second install.
+#
+# A versions dir alone is NOT proof that the host is native today: a host that
+# tried the native installer once and went back to npm keeps a stale
+# versions/<old> behind. Relinking that would pin the host to an old CLI and,
+# because claude_is_native is then true, skip every later update. So relink
+# only on evidence that the host is native NOW:
+#   - the launcher is still there as a symlink into the versions dir, and only
+#     its target is gone (dangling), or
+#   - there is no launcher, AND no npm global package for
+#     @anthropic-ai/claude-code either, so npm is not the install this host was
+#     running. (The package NAME, not $CLAUDE_PKG: that may carry an @<pin>.)
+#     EXCEPT when the npm update stamp is newer than the newest native build:
+#     claude_install writes $CLAUDE_UPDATE_STAMP only after a successful
+#     `npm install -g`, so a newer stamp proves npm was the live install after
+#     that build. That is the documented npm race aftermath ("no package dir AND
+#     no claude binary"), where a missing package is evidence of the crash, not
+#     of a native host (review #1613, round 2).
+#     Trade-off: a native host whose stamp was refreshed by the pre-fix daily
+#     check AND whose launcher is gone entirely (not dangling) falls through to
+#     npm. A dangling launcher still wins, and after this change a native host
+#     no longer refreshes the stamp, so the window only covers hosts hit before.
+# Anything else falls through to the npm self-heal, exactly as before.
+claude_host_is_native_now() {
+  local launcher="$HOME/.local/bin/claude" target root npm_root newest
+  if [ -L "$launcher" ]; then
+    target="$(readlink "$launcher" 2>/dev/null)"
+    # The target may be written with the resolved HOME (/private/var/...) or
+    # the literal one; accept either spelling of the versions root.
+    root="$(claude_realpath "$CLAUDE_NATIVE_ROOT")"
+    case "$target" in
+      "$CLAUDE_NATIVE_ROOT"/*) return 0 ;;
+    esac
+    [ -n "$root" ] && case "$target" in "$root"/*) return 0 ;; esac
+    return 1
+  fi
+  # `-nt` compares whole seconds on macOS bash 3.2; a stamp and a build written
+  # in the same second count as "not newer", which keeps the native reading.
+  newest="$(ls -1 "$CLAUDE_NATIVE_ROOT" 2>/dev/null | sort -V | tail -1)"
+  if [ -e "$CLAUDE_UPDATE_STAMP" ] && [ -n "$newest" ] \
+     && [ "$CLAUDE_UPDATE_STAMP" -nt "$CLAUDE_NATIVE_ROOT/$newest" ]; then
+    return 1
+  fi
+  if command -v npm >/dev/null 2>&1; then
+    npm_root="$(npm root -g 2>/dev/null)"
+    [ -n "$npm_root" ] && [ -d "$npm_root/@anthropic-ai/claude-code" ] && return 1
+  fi
+  return 0
+}
+claude_relink_native() {
+  local newest
+  claude_host_is_native_now || return 1
+  newest="$(ls -1 "$CLAUDE_NATIVE_ROOT" 2>/dev/null | sort -V | tail -1)"
+  [ -n "$newest" ] || return 1
+  [ -x "$CLAUDE_NATIVE_ROOT/$newest" ] || return 1
+  mkdir -p "$HOME/.local/bin" || return 1
+  # macOS: an operator may have locked the symlink with `chflags -h uchg`.
+  command -v chflags >/dev/null 2>&1 && chflags -h nouchg "$HOME/.local/bin/claude" 2>/dev/null
+  ln -sfn "$CLAUDE_NATIVE_ROOT/$newest" "$HOME/.local/bin/claude" || return 1
+  echo "$(date '+%F %T') claude relinked to native $newest" >&2
+  command -v claude >/dev/null 2>&1
+}
+
 if ! command -v claude >/dev/null 2>&1; then
-  claude_install "binary missing -- self-heal"
+  if ! claude_relink_native; then
+    claude_install "binary missing -- self-heal"
+  fi
+elif claude_is_native; then
+  echo "$(date '+%F %T') claude update SKIPPED: native install, npm path disabled" >&2
 elif [ "$AVX_LESS" = "0" ] && [ -z "$(find "$CLAUDE_UPDATE_STAMP" -mtime -1 2>/dev/null)" ]; then
   # AVX-less hosts are excluded on purpose: their claude is pinned, and
   # "keep it current" is exactly what breaks them.
@@ -648,7 +958,7 @@ TMUX="$(command -v tmux)"
 # the one place the pane-scrape recovery could still misread it (the v1.15.0
 # dim-strip catches it on the recovery side, but killing it at the SOURCE on MAIN
 # too closes the gap end-to-end). Parity with the sub-agent launch.
-MCP_BATCH_ENV="export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 CLAUDE_CODE_DISABLE_AGENT_VIEW=1 MCP_SERVER_CONNECTION_BATCH_SIZE=10 MCP_CONNECTION_NONBLOCKING=1 MCP_TIMEOUT=60000 && "
+MCP_BATCH_ENV="export CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1 CLAUDE_CODE_DISABLE_AGENT_VIEW=1 MCP_SERVER_CONNECTION_BATCH_SIZE=10 MCP_CONNECTION_NONBLOCKING=1 MCP_TIMEOUT=60000 && { [ \"\$(id -u)\" != 0 ] || export IS_SANDBOX=1; } && "
 
 # Resolve the main agent's model so we can pass --model explicitly. Without
 # --model claude-code falls back to its built-in default, which can drift
@@ -663,7 +973,7 @@ MAIN_MODEL="$(resolve_main_model)"
 MODEL_FLAG=""
 # Single-quote the model id so values like `claude-opus-4-8[1m]` survive the
 # tmux command-string round-trip without the inner shell glob-expanding `[1m]`.
-[ -n "$MAIN_MODEL" ] && MODEL_FLAG="--model '$MAIN_MODEL' "
+[ -n "$MAIN_MODEL" ] && MODEL_FLAG="--model $(sh_single_quote "$MAIN_MODEL") "
 
 # Main-agent config isolation (OPT-IN, default OFF).
 #
@@ -734,7 +1044,7 @@ if [ -n "$_node_bin" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
       # Both carry their OWN .credentials.json (an operator-logged-in dir for
       # `explicit`, a registered plan's dir for `rotated` -- design 6.5/4) --
       # neither wants the fleet token injected below.
-      CFG_ENV="export CLAUDE_CONFIG_DIR='$_cfg_dir' && "
+      CFG_ENV="export CLAUDE_CONFIG_DIR=$(sh_single_quote "$_cfg_dir") && "
     elif [ "$_cfg_mode" = "token" ]; then
       # Token-mode rotated plan: same credential-less dir as `isolated`, but
       # export THAT plan's vault-stored token instead of the flotta's.
@@ -746,13 +1056,13 @@ if [ -n "$_node_bin" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
       # `_plan_token=$(...)` assignment propagates that exit status, so the
       # `&&` chain stops here rather than launching unauthenticated (PR #1304
       # review (c)).
-      CFG_ENV="export CLAUDE_CONFIG_DIR='$_cfg_dir' && _plan_token=\"\$(\"$_node_bin\" '$INSTALL_DIR/scripts/resolve-plan-token-env.mjs' '$_cfg_token_secret' '$INSTALL_DIR/store/.claude-oauth-token' '$INSTALL_DIR/store/channels-failures.log')\" && export CLAUDE_CODE_OAUTH_TOKEN=\"\$_plan_token\" && "
+      CFG_ENV="export CLAUDE_CONFIG_DIR=$(sh_single_quote "$_cfg_dir") && _plan_token=\"\$($(sh_single_quote "$_node_bin") $(sh_single_quote "$INSTALL_DIR/scripts/resolve-plan-token-env.mjs") $(sh_single_quote "$_cfg_token_secret") $(sh_single_quote "$INSTALL_DIR/store/.claude-oauth-token") $(sh_single_quote "$INSTALL_DIR/store/channels-failures.log"))\" && export CLAUDE_CODE_OAUTH_TOKEN=\"\$_plan_token\" && "
     else
       # Seed the token from the SAME 0600 file the isolated dir is gated on, so
       # the config dir and the active token always match (the isolated dir carries
       # no .credentials.json). $(cat) is evaluated in the launched shell so the
       # secret never lands in the argv/`ps` command string.
-      CFG_ENV="export CLAUDE_CONFIG_DIR='$_cfg_dir' && export CLAUDE_CODE_OAUTH_TOKEN=\"\$(cat '$INSTALL_DIR/store/.claude-oauth-token')\" && "
+      CFG_ENV="export CLAUDE_CONFIG_DIR=$(sh_single_quote "$_cfg_dir") && export CLAUDE_CODE_OAUTH_TOKEN=\"\$(cat $(sh_single_quote "$INSTALL_DIR/store/.claude-oauth-token"))\" && "
     fi
     echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh: main-agent $_cfg_mode CLAUDE_CONFIG_DIR=$_cfg_dir" >> "$INSTALL_DIR/store/channels-failures.log"
   fi
@@ -779,7 +1089,7 @@ if [ -n "$_node_bin" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
       curl -s --max-time 5 -X POST "http://localhost:${_guard_port:-3420}/api/messages" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $(cat "$INSTALL_DIR/store/.dashboard-token")" \
-        -d "{\"from\":\"channels-sh-guard\",\"to\":\"${MAIN_AGENT_ID:-marveen}\",\"content\":\"[GUARD] A fo agens a KOZOS ~/.claude alol indult, pedig van flotta setup-token (store/.claude-oauth-token). A MAIN_AGENT_ISOLATED_CONFIG nincs beallitva, ezert az auth a rotalodo megosztott credentialbol megy: ez lejarhat, 401-be all a TUI, es a csatorna NEMAN elerhetetlen lesz. Teendo: MAIN_AGENT_ISOLATED_CONFIG=1 beallitasa, majd channels session restart.\"}" \
+        -d "{\"from\":\"$(_guard_sender)\",\"to\":\"${MAIN_AGENT_ID:-marveen}\",\"content\":\"[GUARD] A fo agens a KOZOS ~/.claude alol indult, pedig van flotta setup-token (store/.claude-oauth-token). A MAIN_AGENT_ISOLATED_CONFIG nincs beallitva, ezert az auth a rotalodo megosztott credentialbol megy: ez lejarhat, 401-be all a TUI, es a csatorna NEMAN elerhetetlen lesz. Teendo: MAIN_AGENT_ISOLATED_CONFIG=1 beallitasa, majd channels session restart.\"}" \
         -o /dev/null -w '%{http_code}' 2>>"$INSTALL_DIR/store/channels-failures.log" > "$INSTALL_DIR/store/.channels-guard-http.$$" || true
       # Honest delivery (NOTIFYVAKSWEEP826 zaro kor): a fenti WARN csak a helyi
       # logban el -- ha a koordinatornak szolo POST elbukik, az is a logba
@@ -805,7 +1115,7 @@ if [ -n "$_node_bin" ] && [ -f "$INSTALL_DIR/dist/web/agent-process.js" ]; then
       curl -s --max-time 5 -X POST "http://localhost:${_guard_port:-3420}/api/messages" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $(cat "$INSTALL_DIR/store/.dashboard-token")" \
-        -d "{\"from\":\"channels-sh-guard\",\"to\":\"${MAIN_AGENT_ID:-marveen}\",\"content\":\"[GUARD] A channels session most a KOZOS ~/.claude alol indult, pedig letezik izolalt config dir (.channels-config). A MAIN_AGENT_ISOLATED_CONFIG beallitas valoszinuleg elveszett (store/config-overrides.json torlodott es nincs .env kulcs). Az auth a rotalodo shared sessionbol megy, 401-veszely. Teendo: MAIN_AGENT_ISOLATED_CONFIG=1 visszaallitasa, majd channels session restart.\"}" \
+        -d "{\"from\":\"$(_guard_sender)\",\"to\":\"${MAIN_AGENT_ID:-marveen}\",\"content\":\"[GUARD] A channels session most a KOZOS ~/.claude alol indult, pedig letezik izolalt config dir (.channels-config). A MAIN_AGENT_ISOLATED_CONFIG beallitas valoszinuleg elveszett (store/config-overrides.json torlodott es nincs .env kulcs). Az auth a rotalodo shared sessionbol megy, 401-veszely. Teendo: MAIN_AGENT_ISOLATED_CONFIG=1 visszaallitasa, majd channels session restart.\"}" \
         -o /dev/null -w '%{http_code}' 2>>"$INSTALL_DIR/store/channels-failures.log" > "$INSTALL_DIR/store/.channels-guard-http.$$" || true
       # Honest delivery (NOTIFYVAKSWEEP826 zaro kor): a fenti WARN csak a helyi
       # logban el -- ha a koordinatornak szolo POST elbukik, az is a logba
@@ -884,7 +1194,7 @@ if command -v node >/dev/null 2>&1; then
 fi
 
 # Régi session takarítás
-$TMUX kill-session -t "$SESSION" 2>/dev/null
+$TMUX kill-session -t "=$SESSION:" 2>/dev/null
 
 # Reap orphan main-agent channel pollers (bun/node grandchildren of the
 # previous tmux server). A tmux kill-session does not always tear them down,
@@ -928,7 +1238,19 @@ fi
 # an install path with regex metacharacters can't break the exclusion. The var
 # is named `subdir` (not `sub`) because `sub` is a reserved awk function name and
 # BSD/macOS awk syntax-errors on it.
-ORPHAN_PIDS2="$(/bin/ps eww -e 2>/dev/null | awk -v needle="CLAUDE_PLUGIN_ROOT=" -v prov="/${CHANNEL_PROVIDER}" -v subdir="${INSTALL_DIR}/agents/" '$0 ~ needle && $0 ~ prov && index($0, subdir) == 0 { print $1 }')"
+# `ps axeww`, not `ps eww -e`: on macOS the latter drops every process without
+# a controlling terminal, and an orphan whose tmux pane is gone is exactly that
+# (card PSEWWMACOSBLIND1007). The first pass above is fixed in its own PR (#1738).
+# The provider segment is matched INSIDE the CLAUDE_PLUGIN_ROOT value and must end
+# on a path/version/space boundary (same rule as PLUGIN_ROOT_NEEDLE in
+# src/web/channel-poller-reap.ts): a bare `$0 ~ "/telegram"` also hit a
+# `/telegram-coordinator` plugin, or any process whose argv merely mentioned both
+# strings. The slack plugin's cache dir is `slack-channel`.
+case "$CHANNEL_PROVIDER" in
+  slack) PLUGIN_SEG="/slack-channel" ;;
+  *)     PLUGIN_SEG="/${CHANNEL_PROVIDER}" ;;
+esac
+ORPHAN_PIDS2="$(/bin/ps axeww 2>/dev/null | awk -v needle="CLAUDE_PLUGIN_ROOT=" -v prov="$PLUGIN_SEG" -v subdir="${INSTALL_DIR}/agents/" '$0 ~ (needle "[^ ]*" prov "([/@ ]|$)") && index($0, subdir) == 0 { print $1 }')"
 if [ -n "$ORPHAN_PIDS2" ]; then
   # shellcheck disable=SC2086
   /bin/kill -TERM $ORPHAN_PIDS2 2>/dev/null || true
@@ -980,7 +1302,7 @@ fi
 # session's poller does carry it (measured in #915) -- the old comment claiming
 # otherwise described the unexported state.
 export "$STATE_ENV_VAR"="$MAIN_CHAN_DIR"
-STATE_DIR_ENV="export ${STATE_ENV_VAR}='${MAIN_CHAN_DIR}' && "
+STATE_DIR_ENV="export ${STATE_ENV_VAR}=$(sh_single_quote "$MAIN_CHAN_DIR") && "
 
 # P1 FIX: put the Claude auth token into the tmux SERVER global env BEFORE
 # new-session. A new session inherits the tmux SERVER's global environment, not
@@ -1009,8 +1331,10 @@ STATE_DIR_ENV="export ${STATE_ENV_VAR}='${MAIN_CHAN_DIR}' && "
 # lost. When the dashboard's worker session then created the server, our
 # new-session inherited its token-less global env: the channels claude came up
 # "Not logged in", --channels ignored, Telegram dead, silently. Two layers now:
-#   1. the token rides on OUR new-session itself (`-e`, tmux >= 3.2), so this
-#      session has it whoever created the server;
+#   1. OUR pane sources the token from a 0600 file before anything else runs
+#      (TOKENARGV929; it used to ride on new-session `-e`, which left it in the
+#      tmux server's command line), so this session has it whoever created
+#      the server;
 #   2. the globals are set again right AFTER new-session, when a server
 #      certainly exists, so a later pane relaunch (auto-restart runner) and
 #      every sub-agent session inherit them too.
@@ -1025,6 +1349,11 @@ _tmux_set_auth_globals() {
   $TMUX set-environment -g CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION false 2>/dev/null || true
   # CHANSPARE925: and the Agent-view kill switch (see the export above).
   $TMUX set-environment -g CLAUDE_CODE_DISABLE_AGENT_VIEW 1 2>/dev/null || true
+  # ROOTRESPAWN1001: a pane gets the tmux SERVER's environment, so the IS_SANDBOX
+  # export above reaches it only when this script created the server. Put it in
+  # the server's global env on a root host, so a later respawn of any pane (the
+  # dashboard's recovery, a manual respawn of the dead pane) inherits it too.
+  if [ "$(id -u)" = "0" ]; then $TMUX set-environment -g IS_SANDBOX 1 2>/dev/null || true; fi
   # Same for the auto-updater kill switch. A plain `export` above only reaches
   # sessions that inherit THIS shell, i.e. only when channels.sh happened to
   # create the tmux server first; the dashboard's worker sessions often win that
@@ -1035,14 +1364,45 @@ _tmux_set_auth_globals() {
 $TMUX start-server 2>/dev/null || true
 _tmux_set_auth_globals
 
-# new-session -e needs tmux >= 3.2; older tmux keeps the global-env path only.
-TMUX_AUTH_ENV=()
-_tmux_ver="$($TMUX -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)"
-if [ -n "$_tmux_ver" ] && awk -v v="$_tmux_ver" 'BEGIN { split(v, p, "."); exit !((p[1] > 3) || (p[1] == 3 && p[2] >= 2)) }'; then
-  [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && TMUX_AUTH_ENV+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
-  [ -n "${ANTHROPIC_API_KEY:-}" ] && TMUX_AUTH_ENV+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+# Layer 1 of CHANNELSAUTHRACE923, WITHOUT the secret in any argv (TOKENARGV929).
+# It used to be `new-session -e CLAUDE_CODE_OAUTH_TOKEN=<value>`: when that
+# new-session is what creates the tmux server (after a reboot it usually is),
+# the server process KEEPS that command line for its whole life, so the fleet
+# token sat in plain `ps -axo command` output for every local process to read
+# (measured 2026-09-29 on the main host). Now the values go into a 0600 file
+# and the pane's own shell sources it before anything else runs, the same
+# "evaluated in the launched shell, never in argv" rule as the $(cat) in
+# CFG_ENV above. CFG_ENV still comes AFTER it in the pane command, so a mode
+# that exports its own token keeps overriding this one, as it did with -e.
+# The file is rewritten on every launch; store/ is gitignored.
+AUTH_PANE_ENV=""
+_auth_file="$INSTALL_DIR/store/.channels-pane-auth"
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  _q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+  # Written to a NEW file (mktemp: 0600, O_EXCL, never follows a symlink) and
+  # renamed over the final name, so the value never lands in a pre-existing
+  # wider-mode file or through a symlink planted at that path (Geri, #1647
+  # review: `umask 077; : >` only applies to a file it CREATES, and `>` follows
+  # a symlink). mv replaces the name itself, not a symlink's target.
+  _auth_tmp="$(mktemp "$_auth_file.XXXXXX")" || _auth_tmp=""
+  if [ -n "$_auth_tmp" ]; then
+    {
+      [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && printf 'export CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$(_q "$CLAUDE_CODE_OAUTH_TOKEN")"
+      [ -n "${ANTHROPIC_API_KEY:-}" ] && printf 'export ANTHROPIC_API_KEY=%s\n' "$(_q "$ANTHROPIC_API_KEY")"
+      true
+    } > "$_auth_tmp"
+    if mv -f "$_auth_tmp" "$_auth_file"; then
+      AUTH_PANE_ENV=". $(sh_single_quote "$_auth_file") && "
+    else
+      rm -f "$_auth_tmp" 2>/dev/null || true
+    fi
+  fi
+  unset -f _q
+  unset _auth_tmp
+else
+  rm -f "$_auth_file" 2>/dev/null || true
 fi
-unset _tmux_ver
+unset _auth_file
 
 # Owner commands (ELSOKOR922 spec D-4): the Telegram plugin answers /status
 # and /help itself, so those two never reach the session's command hook. Take
@@ -1080,9 +1440,29 @@ fi
 # trade-off is that a prior "$SESSION" can survive into this relaunch, so kill
 # just THIS session first -- never the server, never another agent's session --
 # otherwise new-session below fails with "duplicate session".
-$TMUX kill-session -t "$SESSION" 2>/dev/null || true
-$TMUX new-session -d -s "$SESSION" -c "$INSTALL_DIR" ${TMUX_AUTH_ENV[@]+"${TMUX_AUTH_ENV[@]}"} \
-  "${STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}${CUSTOM_PROVIDER_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}${EXTRA_CHANNELS}"
+#
+# BOOTSTAGGER1007 (a): first, wait (bounded) until the primary and every
+# co-listen provider's host resolves. After a power cut the main session was
+# started before DNS was up, the Slack plugin's MCP connect failed for good
+# ("getaddrinfo ENOTFOUND slack.com"), and the owner's main channel stayed deaf
+# for 30 minutes. With the network up this is one lookup per host.
+# shellcheck disable=SC2046,SC2086
+wait_for_channel_hosts $(channel_wait_hosts "$CHANNEL_PROVIDER" $CHANNEL_PLUGINS_EXTRA) || true
+$TMUX kill-session -t "=$SESSION:" 2>/dev/null || true
+# TMUXSERVERREAP929: create the session WITHOUT this shell's state-dir var in
+# the tmux client's environment. The export above is meant for THIS session's
+# claude/poller, and the command below re-exports it for the pane anyway. But
+# when this new-session is what creates the shared tmux server (after a host
+# reboot it usually is -- `start-server` alone does not keep a server alive,
+# see CHANNELSAUTHRACE923), the server inherits the client's environment:
+# (1) the pre-respawn poller reap's env scan then matched the tmux server
+# process itself and killed it, taking every agent session on the host with it
+# (measured on a live host three times in 17 hours), and (2) the var landed in
+# the server's global environment, so every sub-agent session inherited the
+# MAIN session's channel state dir. The -g -u after the launch cleans a server
+# polluted earlier.
+env -u "$STATE_ENV_VAR" $TMUX new-session -d -s "$SESSION" -c "$INSTALL_DIR" \
+  "${AUTH_PANE_ENV}${STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}${CUSTOM_PROVIDER_ENV}$CLAUDE --dangerously-skip-permissions${EXTRA_SETTINGS_FLAG} ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}${EXTRA_CHANNELS}"
 # The server certainly exists now: see CHANNELSAUTHRACE923 above.
 _tmux_set_auth_globals
 # remain-on-exit: without this, if the pane's claude process dies for ANY
@@ -1099,7 +1479,8 @@ _tmux_set_auth_globals
 # remain-on-exit on, the pane survives as "dead" and the relaunch can always
 # find and reuse it. (Also fixed at the reap itself, see channel-poller-reap.ts;
 # this is the defense-in-depth layer, not the only fix.)
-$TMUX set-option -t "$SESSION" remain-on-exit on 2>/dev/null || true
+$TMUX set-option -t "=$SESSION:" remain-on-exit on 2>/dev/null || true
+$TMUX set-environment -g -u "$STATE_ENV_VAR" 2>/dev/null || true
 
 # Session startup guard: a Claude Code first-run dialogusait auto-accept-eljuk
 # kulonben a headless session orokre parkolna a prompton es a Telegram plugin
@@ -1135,11 +1516,11 @@ _answer_accept_dialog() {
   _cur=$(printf '%s\n' "$1" | grep -n "❯" | head -1 | cut -d: -f1)
   _yes=$(printf '%s\n' "$1" | grep -n "Yes" | grep -v "No, exit" | head -1 | cut -d: -f1)
   if [ -n "$_cur" ] && [ -n "$_yes" ] && [ "$_yes" = "$_cur" ]; then
-    $TMUX send-keys -t "$SESSION" Enter
+    $TMUX send-keys -t "=$SESSION:" Enter
   elif [ -n "$_cur" ] && [ -n "$_yes" ] && [ "$_yes" = "$((_cur + 1))" ]; then
-    $TMUX send-keys -t "$SESSION" Down
+    $TMUX send-keys -t "=$SESSION:" Down
     sleep 1
-    $TMUX send-keys -t "$SESSION" Enter
+    $TMUX send-keys -t "=$SESSION:" Enter
   else
     echo "channels.sh: elfogado dialogus ismeretlen alakban -- nem kuldok billentyut (TRUSTGATE901)" >&2
   fi
@@ -1149,12 +1530,12 @@ _answer_accept_dialog() {
 _eperm_restarted=0
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
   sleep 1
-  pane=$($TMUX capture-pane -t "$SESSION" -p 2>/dev/null || true)
+  pane=$($TMUX capture-pane -t "=$SESSION:" -p 2>/dev/null || true)
   case "$pane" in
     *"EPERM"*|*"Operation not permitted"*|*"operation not permitted"*)
       if [ "$_eperm_restarted" = "0" ]; then
         _eperm_restarted=1
-        $TMUX kill-session -t "$SESSION" 2>/dev/null
+        $TMUX kill-session -t "=$SESSION:" 2>/dev/null
         _CHANNELS_STARTDIR="$(mktemp -d /tmp/marveen-channels-XXXXXX)"
         # Carry the project CLAUDE.md into the fallback cwd so the session keeps
         # Marveen's instructions/personality instead of running as a generic,
@@ -1172,12 +1553,12 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
         # invasive change (a stable fallback dir + a seeded ~/.claude.json project
         # entry); see the PR description / card 7EB18437.
         [ -e "$INSTALL_DIR/CLAUDE.md" ] && ln -sf "$INSTALL_DIR/CLAUDE.md" "$_CHANNELS_STARTDIR/CLAUDE.md" 2>/dev/null || true
-        $TMUX new-session -d -s "$SESSION" -c "$_CHANNELS_STARTDIR" ${TMUX_AUTH_ENV[@]+"${TMUX_AUTH_ENV[@]}"} \
-          "${STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}${CUSTOM_PROVIDER_ENV}$CLAUDE --dangerously-skip-permissions ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}${EXTRA_CHANNELS}"
+        env -u "$STATE_ENV_VAR" $TMUX new-session -d -s "$SESSION" -c "$_CHANNELS_STARTDIR" \
+          "${AUTH_PANE_ENV}${STATE_DIR_ENV}${MCP_BATCH_ENV}${CFG_ENV}${CUSTOM_PROVIDER_ENV}$CLAUDE --dangerously-skip-permissions${EXTRA_SETTINGS_FLAG} ${MODEL_FLAG}--channels plugin:${PLUGIN_ID}${EXTRA_CHANNELS}"
         # See the primary new-session above: remain-on-exit keeps the pane
         # (and session) alive if claude dies early, so the scheduled relaunch
         # can always find it. This is the /tmp-fallback launch path, same fix.
-        $TMUX set-option -t "$SESSION" remain-on-exit on 2>/dev/null || true
+        $TMUX set-option -t "=$SESSION:" remain-on-exit on 2>/dev/null || true
         unset _CHANNELS_STARTDIR
       fi
       continue
@@ -1193,7 +1574,7 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
       continue
       ;;
     *"Welcome to Claude Code"*)
-      $TMUX send-keys -t "$SESSION" Enter
+      $TMUX send-keys -t "=$SESSION:" Enter
       sleep 1
       continue
       ;;
@@ -1208,7 +1589,7 @@ unset _eperm_restarted
 # longer uses Remote Control.)
 _bot_name="${BOT_NAME:-${MAIN_AGENT_ID:-marveen}}"
 sleep 1
-$TMUX send-keys -t "$SESSION" "/rename ${_bot_name}" Enter
+$TMUX send-keys -t "=$SESSION:" "/rename ${_bot_name}" Enter
 unset _bot_name
 
 # Reset the keep-alive watchdog baseline so a session that was just restarted
@@ -1270,7 +1651,7 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
 #     line alone said nothing about whether the fix landed.
 (
   sleep 15
-  CLAUDE_PID="$($TMUX list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  CLAUDE_PID="$($TMUX list-panes -t "=$SESSION:" -F '#{pane_pid}' 2>/dev/null | head -1)"
   # Check 1: bun grandchild of the marveen-channels claude
   BUN_CHILD=""
   if [ -n "$CLAUDE_PID" ]; then
@@ -1290,7 +1671,7 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
   # the dashboard channel-monitor's recovery ladder owns the pane from there.
   PROBE_STATE="unverifiable"
   for _try in 1 2 3; do
-    PROBE_STATE="$($TMUX capture-pane -t "$SESSION" -e -p 2>/dev/null | probe_pane_input_state)"
+    PROBE_STATE="$($TMUX capture-pane -t "=$SESSION:" -e -p 2>/dev/null | probe_pane_input_state)"
     [ "$PROBE_STATE" = "idle" ] && break
     case "$PROBE_STATE" in
       parked:*)
@@ -1300,7 +1681,7 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
         # parked text is never touched here; the stuck-input recovery stack
         # owns it.
         if is_own_probe_residue "${PROBE_STATE#parked:}"; then
-          $TMUX send-keys -t "$SESSION" C-c
+          $TMUX send-keys -t "=$SESSION:" C-c
           sleep 1
         fi
         ;;
@@ -1317,22 +1698,22 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
   # disabled (Enable-only submenu has no Reconnect, the Up+Enter+Enter sequence
   # would land somewhere unsafe). See classify_mcp_plugin_row above for why the
   # matching is row-scoped and glyph-agnostic.
-  $TMUX send-keys -t "$SESSION" Escape
+  $TMUX send-keys -t "=$SESSION:" Escape
   sleep 1
-  $TMUX send-keys -t "$SESSION" "/mcp" Enter
+  $TMUX send-keys -t "=$SESSION:" "/mcp" Enter
   sleep 3
-  PANE="$($TMUX capture-pane -t "$SESSION" -p 2>/dev/null || true)"
+  PANE="$($TMUX capture-pane -t "=$SESSION:" -p 2>/dev/null || true)"
 
   classify_mcp_plugin_row "$PANE"
   UNLOCK_FIRED=0
   case "$MCP_PLUGIN_STATE" in
     failed)
       echo "$(date '+%Y-%m-%d %H:%M:%S') channels.sh post-init: $CHANNEL_PROVIDER plugin row failed, firing /mcp Up+Enter+Enter unlock -- row: $MCP_PLUGIN_ROW" >> "$INSTALL_DIR/store/channels-failures.log"
-      $TMUX send-keys -t "$SESSION" Up
+      $TMUX send-keys -t "=$SESSION:" Up
       sleep 1
-      $TMUX send-keys -t "$SESSION" Enter
+      $TMUX send-keys -t "=$SESSION:" Enter
       sleep 2
-      $TMUX send-keys -t "$SESSION" Enter
+      $TMUX send-keys -t "=$SESSION:" Enter
       sleep 4
       UNLOCK_FIRED=1
       ;;
@@ -1353,17 +1734,17 @@ date +%s > "$INSTALL_DIR/store/.channel-last-respawn"
   # stuck-input recovery stack) is cleared with a single Ctrl-C and re-proven.
   END_STATE="unknown"
   for _i in 1 2 3 4 5; do
-    $TMUX send-keys -t "$SESSION" Escape
+    $TMUX send-keys -t "=$SESSION:" Escape
     sleep 1
-    END_STATE="$($TMUX capture-pane -t "$SESSION" -e -p 2>/dev/null | probe_pane_input_state)"
+    END_STATE="$($TMUX capture-pane -t "=$SESSION:" -e -p 2>/dev/null | probe_pane_input_state)"
     [ "$END_STATE" = "idle" ] && break
   done
   case "$END_STATE" in
     parked:*)
       if is_own_probe_residue "${END_STATE#parked:}"; then
-        $TMUX send-keys -t "$SESSION" C-c
+        $TMUX send-keys -t "=$SESSION:" C-c
         sleep 1
-        END_STATE="$($TMUX capture-pane -t "$SESSION" -e -p 2>/dev/null | probe_pane_input_state)"
+        END_STATE="$($TMUX capture-pane -t "=$SESSION:" -e -p 2>/dev/null | probe_pane_input_state)"
       fi
       ;;
   esac
@@ -1528,10 +1909,10 @@ respawn_log() {
 # amugy is kileptet ha a session eltunik). A ${SESSION}-hoz tartozo claude
 # process pid-je -- ugyanaz a lekerdezes mint a post-init unlock Check 1-e
 # feljebb.
-_watchdog_claude_pid="$($TMUX list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
+_watchdog_claude_pid="$($TMUX list-panes -t "=$SESSION:" -F '#{pane_pid}' 2>/dev/null | head -1)"
 
 # Várakozás amíg a session él
-while $TMUX has-session -t "$SESSION" 2>/dev/null; do
+while $TMUX has-session -t "=$SESSION:" 2>/dev/null; do
   sleep 5
 
   # PANEDEAD919: claude itself exited but remain-on-exit kept the pane (and so
@@ -1548,7 +1929,7 @@ while $TMUX has-session -t "$SESSION" 2>/dev/null; do
   # CHANSPARE925 review: channel-watchdog.sh and stuck-modal-guard.sh use
   # a pane respawn (-k), which gives the pane a NEW pid while this session and loop
   # live on. Re-read it every tick, or our own fresh plugin reads as foreign.
-  _pane_pid_now="$($TMUX list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  _pane_pid_now="$($TMUX list-panes -t "=$SESSION:" -F '#{pane_pid}' 2>/dev/null | head -1)"
   [ -n "$_pane_pid_now" ] && _watchdog_claude_pid="$_pane_pid_now"
   unset _pane_pid_now
   _plugin_alive=false

@@ -128,7 +128,14 @@ if [ -s "$QUOTA_FILE" ] && command -v python3 >/dev/null 2>&1; then
   fi
   case "$QUOTA_OUT" in
     STALE*)
-      log "quota file stale ($(printf '%s' "$QUOTA_OUT" | cut -f2)s), skipping the measured path"
+      # A reading with no usable written_at is not "old", it is unstamped, and
+      # the fix is in the writer, not in the clock -- so it gets its own words
+      # instead of an age counted from 1970.
+      if [ "$(printf '%s' "$QUOTA_OUT" | cut -f2)" = "nostamp" ]; then
+        log "quota file has no usable written_at ($(printf '%s' "$QUOTA_OUT" | cut -f3)), skipping the measured path"
+      else
+        log "quota file stale ($(printf '%s' "$QUOTA_OUT" | cut -f2)s), skipping the measured path"
+      fi
       ;;
     EXPIRED*)
       # Said out loud on purpose: an alert withheld must not look the same as a
@@ -167,10 +174,10 @@ PANE_TAIL=15
 # Every fleet session, plus the main channels one explicitly so a rename is
 # still followed even when tmux cannot be listed.
 pane_text() {
-  tmux capture-pane -t "$SESSION" -p 2>/dev/null | tail -n "$PANE_TAIL"
+  tmux capture-pane -t "=$SESSION:" -p 2>/dev/null | tail -n "$PANE_TAIL"
   tmux list-sessions -F '#{session_name}' 2>/dev/null | while read -r s; do
     [ "$s" = "$SESSION" ] && continue
-    tmux capture-pane -t "$s" -p 2>/dev/null | tail -n "$PANE_TAIL"
+    tmux capture-pane -t "=$s:" -p 2>/dev/null | tail -n "$PANE_TAIL"
   done
 }
 

@@ -42,10 +42,13 @@ write_result() {
 
 retry() {
   local tries="$1" pause="$2"; shift 2
-  local i=1
+  local i=1 rc=0
   while true; do
-    if "$@"; then return 0; fi
-    if [ "$i" -ge "$tries" ]; then return 1; fi
+    rc=0; "$@" || rc=$?
+    if [ "$rc" -eq 0 ]; then return 0; fi
+    # UPDOOMNPMCI926: return the LAST attempt's exit code, not a flat 1 -- a
+    # caller that must tell an OOM kill (137) from a lockfile error needs it.
+    if [ "$i" -ge "$tries" ]; then return "$rc"; fi
     echo -e "  ${DIM}retry $i/$tries...${NC}"; sleep "$pause"; pause=$(( pause * 2 )); i=$(( i + 1 ))
   done
 }
@@ -192,19 +195,28 @@ UPDATE_PIDFILE_TMP="$UPDATE_PIDFILE.$$.tmp"
 # leaked; leave the dashboard's pidfile alone so the lock does not
 # disappear on a write error.
 trap 'rc=$?; write_result "$rc"; rm -f "$UPDATE_PIDFILE_TMP"' EXIT
+# Wall-clock epoch in ms for the pidfile's second line. date +%s%3N is
+# GNU-only: on BSD (macOS) %3N is no conversion at all, and uutils
+# coreutils (the Rust date, 0.8.0) ignores the width and prints the full
+# nanoseconds, 19 digits, which checkNoConcurrentUpdate read as a start
+# far in the future, so a stale pidfile never aged out (card 48612d05).
+# Only an exactly 13-digit value is taken as ms (good until the year
+# 2286); anything else falls back to seconds * 1000. One-second
+# granularity is plenty for an hour-level age cutoff, and the fallback
+# never prints an empty line, which the helper would read as a legacy
+# pidfile without age info (alive-probe only, no age cutoff).
+update_pidfile_epoch_ms() {
+  local ms
+  ms=$(date +%s%3N 2>/dev/null) || ms=""
+  if [[ "$ms" =~ ^[0-9]{13}$ ]]; then
+    printf '%s\n' "$ms"
+  else
+    printf '%s\n' "$(( $(date +%s) * 1000 ))"
+  fi
+}
 {
   echo "$$"
-  # Portable wall-clock epoch in ms. date +%s%3N is GNU-only; on BSD
-  # (macOS) we fall back to seconds * 1000. One-second granularity is
-  # plenty for an hour-level age cutoff.
-  # Require one-or-more digits; `*` would accept an empty line and
-  # write "<pid>\n\n", which the helper would read as a legacy pidfile
-  # without age info (alive-probe only, no age cutoff).
-  if date +%s%3N 2>/dev/null | grep -q '^[0-9][0-9]*$'; then
-    date +%s%3N
-  else
-    echo $(( $(date +%s) * 1000 ))
-  fi
+  update_pidfile_epoch_ms
 } > "$UPDATE_PIDFILE_TMP"
 mv "$UPDATE_PIDFILE_TMP" "$UPDATE_PIDFILE"
 # Only after mv succeeds do we own the lock; extend the trap to remove
@@ -409,6 +421,57 @@ restore_stash_before_exit() {
   fi
 }
 
+# UPDOOMNPMCI926: `npm ci` failed after the pull. npm ci deletes node_modules
+# before installing, so the tree is on the NEW commit with a half-installed
+# dependency set; the running dashboard still has the old code in memory, but
+# its next start (or any fresh node process) would load from the broken tree.
+# The old path only printed a fixed "package-lock.json out of sync" line and
+# exited 1 with no rollback, so the report said "failed" while the tree sat on
+# the new commit. Measured on a 3.8 GB, swapless host: the OOM killer ended
+# npm ci three times in 33 s (exit 137), and the message blamed the lockfile.
+# Now: name the cause from the exit code, roll back exactly like the build
+# failure below (old commit, its dependencies, its build), and report what
+# actually happened -- including a rollback whose own npm ci failed too.
+npm_ci_failed() {
+  local rc="$1"
+  if [ "$rc" -eq 137 ]; then
+    if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+      echo -e "${RED}ERROR:${NC} npm ci was killed (exit 137, SIGKILL) -- most likely the machine ran out of memory."
+      echo -e "  Check with: dmesg | grep -i 'killed process'  (the lockfile is not the cause)"
+    else
+      echo -e "${RED}HIBA:${NC} az npm ci-t a rendszer leállította (137-es kilépési kód, SIGKILL), valószínűleg elfogyott a memória."
+      echo -e "  Ellenőrzés: dmesg | grep -i 'killed process'  (nem a package-lock.json a hiba)"
+    fi
+  else
+    if [[ "${MARVEEN_LANG:-hu}" == "en" ]]; then
+      echo -e "${RED}ERROR:${NC} npm ci failed (exit code ${rc}). Details: npm ci"
+    else
+      echo -e "${RED}HIBA:${NC} az npm ci sikertelen (kilépési kód: ${rc}). Részletek: npm ci"
+    fi
+  fi
+  echo -e "  Visszaallitas a korabbi verziora (${OLD_VERSION})..."
+  local deps_ok=0
+  if [ -n "$OLD_VERSION_FULL" ]; then
+    git reset --hard "$OLD_VERSION_FULL" >/dev/null 2>&1 || true
+    if npm ci --silent --include=dev 2>/dev/null; then deps_ok=1; fi
+    npm rebuild better-sqlite3 --silent 2>/dev/null || true
+    npm run build --silent 2>/dev/null || true
+    [ -d "$INSTALL_DIR/dist" ] && echo "$OLD_VERSION_FULL" > "$BUILT_COMMIT_FILE"
+  fi
+  local cause="a függőségek telepítése elbukott (kilépési kód: ${rc})"
+  [ "$rc" -eq 137 ] && cause="a függőségek telepítését a rendszer leállította (137, valószínűleg memóriahiány)"
+  if [ "$deps_ok" = "1" ]; then
+    RESULT_STATUS="rolled-back"
+    RESULT_MSG="A frissítés közben ${cause}; a rendszer visszaállt a korábbi működő verzióra (${OLD_VERSION}). A frissítés nem ment ki."
+  else
+    RESULT_STATUS="failed"
+    RESULT_MSG="A frissítés közben ${cause}, és a visszaállítás függőség-telepítése sem sikerült: a kód a korábbi verzión (${OLD_VERSION}) áll, de a node_modules hiányos lehet. Kézi beavatkozás kell: npm ci --include=dev, majd npm run build."
+    echo -e "${RED}HIBA:${NC} a visszaallitas npm ci-je is elbukott; a node_modules hianyos lehet. Kezi beavatkozas kell: npm ci --include=dev && npm run build"
+  fi
+  restore_stash_before_exit
+  exit 6
+}
+
 # Save current version
 OLD_VERSION=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 
@@ -428,8 +491,25 @@ OLD_VERSION_FULL=$(git rev-parse HEAD 2>/dev/null || echo "")
 # DEFAULT -- see the UPDATE_AUTO_REBASE block below, which is off unless the
 # operator of this install turns it on.
 RESULT_PHASE="pull"
-AHEAD=$(git rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)
-BEHIND=$(git rev-list --count 'HEAD..@{u}' 2>/dev/null || echo 0)
+# DIVERGENCE-REF (UPSTREAMSRC927): measure the ref the pull below will merge,
+# fetched NOW -- not `@{u}`. Two ways `@{u}` answered a different question:
+#   - it is only as fresh as the last fetch, and nothing in the product fetches
+#     on a schedule. With local commits and new upstream commits, the stale ref
+#     said "ahead 1, behind 0", this guard let it through, and `pull --ff-only`
+#     then died with a generic message; the UPDATE_AUTO_REBASE=1 path below,
+#     built for exactly that case, never started (measured on a throwaway repo).
+#   - it is whatever the branch tracks, while the pull names origin/<branch>.
+# `git fetch origin <branch>` is the first half of that pull, and FETCH_HEAD is
+# precisely what its merge would take. A failed fetch is said out loud and the
+# guard falls back to the last known origin ref; the pull then reports the
+# network failure itself.
+DIVERGENCE_REF="FETCH_HEAD"
+if ! git fetch --quiet origin "$CURRENT_BRANCH" 2>>"$INSTALL_DIR/store/update.log"; then
+  DIVERGENCE_REF="origin/${CURRENT_BRANCH}"
+  echo -e "  ${ORANGE}Figyelem:${NC} a 'git fetch origin ${CURRENT_BRANCH}' elbukott; az elteres-ellenorzes az utolso ismert ${DIVERGENCE_REF} refet meri, ami elavult lehet."
+fi
+AHEAD=$(git rev-list --count "${DIVERGENCE_REF}..HEAD" 2>/dev/null || echo 0)
+BEHIND=$(git rev-list --count "HEAD..${DIVERGENCE_REF}" 2>/dev/null || echo 0)
 if [ "${AHEAD:-0}" -gt 0 ] && [ "${BEHIND:-0}" -gt 0 ]; then
   # Diverged history: ahead AND behind. #1112 made this refuse ON PURPOSE -- a
   # human has to reconcile it -- and that stays the DEFAULT here. What this adds
@@ -637,6 +717,75 @@ EOF
   return 0
 }
 
+# macOS twin of install_keepalive_probe_timer (KEEPALIVEMAC926). The Linux half
+# landed with #1313 and install-macos.sh got the launchd unit the same day, but
+# the template only reaches NEW installs -- and update.sh, the one thing that
+# runs weekly on the machines that already have the bug, had no Darwin branch at
+# all, so every Mac installed before 2026-09-14 still has no probe.
+# Measured on this install 2026-09-26 05:07: launchctl had no
+# com.marveen.channel-keepalive-probe, and store/channels-failures.log shows
+# main-agent respawns ONLY between 22:00 and 07:00 (19 that night, one every
+# ~15 minutes, zero between 07:00 and 22:00) -- the same quiet-night-reads-as-a-
+# wedge loop the Linux comment above describes. The respawn never clears the
+# condition that triggers it (nothing refreshes the file afterwards either), so
+# it repeats until the owner's first morning message warms the file.
+# Idempotent: once the plist exists this writes nothing and prints nothing. The
+# label is read from the installer so a rename there cannot silently turn this
+# into a weekly reload.
+install_keepalive_probe_launchd() {
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+  _ka_installer="$INSTALL_DIR/scripts/install-channel-keepalive-probe.sh"
+  [ -x "$_ka_installer" ] || return 0
+  command -v launchctl >/dev/null 2>&1 || return 0
+  # #1873: the installer resolves its own com.<SERVICE_ID>.* label.
+  _ka_label="$("$_ka_installer" --print-label 2>/dev/null | head -1)"
+  [ -n "$_ka_label" ] || _ka_label="com.marveen.channel-keepalive-probe"
+  if [ -f "$HOME/Library/LaunchAgents/${_ka_label}.plist" ]; then
+    return 0
+  fi
+  if "$_ka_installer" --load >/dev/null 2>&1; then
+    echo -e "  Keepalive-szonda telepitve (3 percenkent, hamis respawn ellen): ${_ka_label}"
+  else
+    echo -e "  FIGYELEM: a keepalive-szonda telepitese nem sikerult -- inditsd kezzel: scripts/install-channel-keepalive-probe.sh --load"
+  fi
+  return 0
+}
+
+# The stuck-modal guard's launchd twin on Macs that are already installed
+# (MODELCONFIRM1005), the same way and for the same reason as the probe above:
+# install-macos.sh only reaches NEW installs. Measured 2026-10-05 on the Mac
+# mini: the CLI's "Switch model?" dialog held the main session for half an hour
+# and launchctl had no job of any modal guard. The guard's default mode is
+# log-only (STUCK_MODAL_MODE, see stuck-modal-guard.sh): it detects and logs,
+# recovery is opt-in. #1694 review:
+#   - keyed on the job being LOADED, not on the plist existing: a plist left by
+#     a failed `launchctl load` is retried (and reported) on every run instead of
+#     going quiet forever;
+#   - STUCK_MODAL_MODE=off in .env is the opt-out, and it survives updates: no
+#     install, no load.
+# Idempotent: with the job loaded this writes nothing and prints nothing; the
+# label is read from the installer.
+install_stuck_modal_guard_launchd() {
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 0
+  _sm_installer="$INSTALL_DIR/scripts/install-stuck-modal-guard.sh"
+  [ -x "$_sm_installer" ] || return 0
+  command -v launchctl >/dev/null 2>&1 || return 0
+  _sm_mode="$(grep -E '^STUCK_MODAL_MODE=' "$INSTALL_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"'\r ' | tr '[:upper:]' '[:lower:]')"
+  [ "$_sm_mode" = "off" ] && return 0
+  # #1873: the installer resolves its own com.<SERVICE_ID>.* label.
+  _sm_label="$("$_sm_installer" --print-label 2>/dev/null | head -1)"
+  [ -n "$_sm_label" ] || _sm_label="com.marveen.stuck-modal-guard"
+  if launchctl list "$_sm_label" >/dev/null 2>&1; then
+    return 0
+  fi
+  if "$_sm_installer" --load >/dev/null 2>&1; then
+    echo -e "  Beragadt-ablak or telepitve (percenkent; alapbol csak naploz, STUCK_MODAL_MODE): ${_sm_label}"
+  else
+    echo -e "  FIGYELEM: a beragadt-ablak or telepitese nem sikerult -- inditsd kezzel: scripts/install-stuck-modal-guard.sh --load"
+  fi
+  return 0
+}
+
 # Morning-timer parking (MORNTIMERPARK914 -- the missing half of the locked
 # MORNCONS1 decision, 2026-07-27). The #1313 installer change stops ENABLING
 # the 07:27 morning timer on NEW installs, but every already-installed Linux
@@ -773,12 +922,72 @@ EOF
   return 0
 }
 
+# UPDUNITTGENV930: #1450 took `Environment=TELEGRAM_ENV=<home>/.claude/channels/telegram/.env`
+# out of the two notifier units install-linux.sh writes (<slug>-host-watchdog.service and
+# <slug>-notify@.service), but only for NEW installs: an existing host keeps the line,
+# and on a MIGRATED install (install-scoped channel dir) it points at the empty legacy
+# path and overrides the notifier's own resolution, so the failure notifier never sends.
+# Only that exact legacy value goes (<the unit's own HOME>/.claude/channels/telegram/.env):
+# an operator's deliberate TELEGRAM_ENV pointing anywhere else stays. On an
+# unmigrated install removing it is harmless, the notifier falls back to the same path.
+strip_legacy_notifier_telegram_env() {
+  units_dir="${1:-$HOME/.config/systemd/user}"
+  [ -d "$units_dir" ] || return 0
+  _patched=0
+  for _unit in "$units_dir/"*-host-watchdog.service "$units_dir/"*-notify@.service; do
+    [ -f "$_unit" ] || continue
+    # The legacy value is the SHARED dir under the unit's own HOME: the installer writes
+    # both lines from the same $HOME, and the shipped template carried both as the same
+    # /home/<user> placeholder, so one form covers both. Matched as whole
+    # fixed strings: the install-scoped <install>/.claude/channels/telegram/.env, the
+    # correct path on a migrated install, must never match.
+    _uhome="$(sed -n 's/^Environment=HOME=//p' "$_unit" | head -1)"
+    [ -n "$_uhome" ] || _uhome="$HOME"
+    _legacy1="Environment=TELEGRAM_ENV=${_uhome}/.claude/channels/telegram/.env"
+    if grep -qxF -e "$_legacy1" "$_unit"; then
+      if grep -vxF -e "$_legacy1" "$_unit" >"${_unit}.marveen-new" 2>/dev/null \
+         && cat "${_unit}.marveen-new" >"$_unit" 2>/dev/null; then
+        rm -f "${_unit}.marveen-new"
+        _patched=1
+        echo -e "  Hiba-ertesito unit javitva (regi TELEGRAM_ENV sor ki): $(basename "$_unit")"
+      else
+        rm -f "${_unit}.marveen-new"
+        echo -e "  FIGYELEM: a hiba-ertesito unit nem volt irhato: $_unit"
+      fi
+    fi
+  done
+  if [ "$_patched" = "1" ]; then
+    systemctl --user daemon-reload 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Shell rc secret scrub (Linux only, SECSZIVEKKIADAS1008). Installers before
+# #1785 wrote the Claude token / API key as `export ...=` lines into ~/.bashrc
+# and ~/.zshrc; nothing on the update path removed them, and a re-run of the
+# installer never reached its own cleanup on an install that already has auth.
+# The functions live in scripts/lib/rc-secrets.sh (identical to the installer's
+# copy, kept equal by a test). Idempotent: no export line, no change. Like every
+# repair here it lands on the update.sh run AFTER the one that pulls it (no
+# re-exec). A failure never stops the update: it is reported, and retried next run.
+scrub_rc_secrets() {
+  [ "$(uname -s 2>/dev/null)" = "Linux" ] || return 0
+  [ -f "$INSTALL_DIR/scripts/lib/rc-secrets.sh" ] || return 0
+  ( . "$INSTALL_DIR/scripts/lib/rc-secrets.sh" && scrub_secret_exports_from_rc ) \
+    || echo -e "  ${ORANGE}FIGYELEM:${NC} a shell rc fajlok titok-takaritasa nem sikerult, a kovetkezo frissites ujraprobalja."
+  return 0
+}
+
 run_unit_maintenance() {
   repair_morning_timer "$@"
   migrate_channels_restart "$@"
   install_keepalive_probe_timer "$@"
+  install_keepalive_probe_launchd "$@"
+  install_stuck_modal_guard_launchd "$@"
   install_main_inbox_observer_unit "$@"
+  strip_legacy_notifier_telegram_env "$@"
   park_morning_timer "$@"
+  scrub_rc_secrets
   return 0
 }
 run_unit_maintenance
@@ -1001,10 +1210,10 @@ if git diff "$OLD_VERSION" "$NEW_VERSION" --name-only | grep -qE "^package(-lock
   # TypeScript compiler and makes the build below fail -> rollback -> the same
   # failure next run, forever (the rollback also reverts the freshly pulled
   # update.sh, so a fix can never arrive through this path on its own).
-  if ! retry 3 3 npm ci --silent --include=dev; then
-    echo -e "  HIBA: npm ci sikertelen. Valoszinuleg a package-lock.json nincs szinkronban."
-    echo -e "  Reszletekert futtasd: npm ci"
-    exit 1
+  NPM_CI_RC=0
+  retry 3 3 npm ci --silent --include=dev || NPM_CI_RC=$?
+  if [ "$NPM_CI_RC" -ne 0 ]; then
+    npm_ci_failed "$NPM_CI_RC"
   fi
   # Security posture check, NOT a hard gate. npm audit queries the
   # registry and can fail for reasons entirely outside the operator's

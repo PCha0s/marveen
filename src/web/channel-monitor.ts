@@ -1,7 +1,9 @@
 import { tmuxStderr } from './tmux-stderr.js'
+import { writeMainExtraPluginsSettings } from './main-extra-plugins-settings.js'
 import { decideSkipTrace, decideMenuPassTrace, type SkipTraceState } from './monitor-trace.js'
+import { releaseOwnRespawnStamp, type OwnRespawnStamp } from './respawn-stamp-release.js'
 import { existsSync, readFileSync, statSync, writeFileSync, utimesSync } from 'node:fs'
-import { hostname } from 'node:os'
+import { hostname, loadavg, cpus } from 'node:os'
 import { join } from 'node:path'
 import { execFileSync, spawn } from 'node:child_process'
 import { makeLazyBinResolver } from '../platform.js'
@@ -9,7 +11,7 @@ import { WEB_PORT } from '../config.js'
 import { logger } from '../logger.js'
 import { mainRelaunchSucceeded } from '../auto-restart.js'
 import { MAIN_AGENT_ID, SERVICE_ID, BOT_NAME, CHANNEL_PROVIDER, PROJECT_ROOT, RESPAWN_ENABLED } from '../config.js'
-import { DISTRIBUTION_DEFAULT_AGENT_MODEL } from '../config-registry.js'
+import { launchableDistributionDefaultSync } from './default-model-guard.js'
 import { agentDir, listAgentNames, readAgentChannelProvider } from './agent-config.js'
 import { listKanbanCards } from '../db.js'
 import {
@@ -22,6 +24,7 @@ import {
   dismissModelConsentDialogIfPresent,
   stampFableOverageConsentSharedRoots,
   isAgentRunning,
+  isSessionReadyForPrompt,
   sendPromptToSession,
   startAgentProcess,
   stopAgentProcess,
@@ -32,10 +35,12 @@ import {
   FLEET_OAUTH_TOKEN_PATH,
   answerFirstRunGates,
   shSingleQuote,
+  fleetVenvPathPrefix,
 } from './agent-process.js'
 import { sendSystemDirective } from './system-directive.js'
 import { isRestartInFlight, beginRestart, endRestart } from './restart-lock.js'
 import { resolveMainConfigDecision, type MainConfigDecision } from './main-config-decision.js'
+import { runMainContinueRestart, type ContinueRestartResult } from './main-rotation-continue.js'
 import { withSessionSendLock } from './session-send-lock.js'
 import { reapChannelOrphans, reapDetachedChannelClaudes, collectPollerEvidence, reapForeignMainPollers } from './channel-poller-reap.js'
 import { probeTelegramConflict } from './channel-conflict-probe.js'
@@ -68,7 +73,12 @@ import {
 // getClaudePidForSession + hasChannelPluginAlive live in the shared liveness
 // module so the standalone channel-coordinator reuses the exact same probe.
 import { getClaudePidForSession, hasChannelPluginAlive, probeChannelPluginLiveness, classifyRespawnStampAdvance } from '../channel-coordinator/liveness.js'
+import { colistenProviders, runColistenCheck, type ColistenState } from './main-colisten-health.js'
+import { runReconcileBurst, waitReconcileGap, RECONCILE_MAIN_FIRST_MAX_WAIT_MS } from './reconcile-stagger.js'
 import { getDesiredAgents } from './agent-desired-state.js'
+import { startSleepWakeDetector, systemSleptBetween } from './sleep-wake-detector.js'
+import { ROOT_SANDBOX_ENV } from './root-sandbox-env.js'
+import { exactTmuxTarget } from '../tmux-target.js'
 
 // Lazily resolved (see makeLazyBinResolver): a module-level `resolveFromPath`
 // const throws at IMPORT time, so any environment where the binary is not
@@ -330,6 +340,66 @@ const STUCK_RESTART_MAX_CONSECUTIVE = 3
 let stuckRestartCount = 0
 let lastStuckRestartAt = 0
 
+// STUCKFRAGMENT915. A clear that FAILED leaves behind a fragment we KNOW is
+// machine-origin -- WE parked it and WE failed to clear it. But the fragment may
+// have lost every marker parkedMachineOriginInput matches on (the prefixes AND
+// all three MACHINE_ORIGIN_TRUNCATED_MARKERS), and the restart guard then reads
+// it as "possibly a human draft" and defers forever. That is the 2026-09-03
+// wedge (25.4h mute) and it is still live: measured on one runner lifetime,
+// 10 `Input buffer could not be emptied` errors produced 0 pane restarts, even
+// though that error's own text promises "escalation will have to restart the
+// pane".
+//
+// A better detector cannot fix this, and that is the whole point: the cut
+// destroyed the evidence, so the fact is no longer IN the bytes. It is only
+// knowable at the moment the clear failed -- so record it there.
+//
+// Lifecycle: set only where a clear returned false on a fragment WE injected
+// (clear-scheduled / clear-preamble); cleared the moment the box is proven
+// EMPTY -- which is also the only moment a human draft can begin, so the flag
+// can never be inherited by text a person typed.
+const machineFragmentLeft = new Set<string>()
+
+export function noteMachineFragmentLeft(session: string): void { machineFragmentLeft.add(session) }
+export function clearMachineFragmentLeft(session: string): void { machineFragmentLeft.delete(session) }
+export function hasMachineFragmentLeft(session: string): boolean { return machineFragmentLeft.has(session) }
+
+// The two lifecycle DECISIONS, as functions the call sites use -- not as prose
+// beside three bare calls. A decision that exists only at its call site cannot be
+// tested, and deleting the call leaves the suite green: measured on this branch,
+// three of the four bookkeeping mutants survived the full run (590 files / 7514
+// tests). The primitives above stay -- they are the store; these are the policy.
+
+/** What a parked-clear attempt is allowed to record.
+ *
+ *  Only `left-fragment` is a fact about the BOX: we tried, and text we injected
+ *  stayed in it. `cleared` is a claim about our own ACTION, and `skipped-locked`
+ *  means we never touched the box at all -- neither tells us the box is empty
+ *  NOW, so neither may write the record. Forgetting has exactly one owner
+ *  (onParkedState), because this whole fix exists for a clear that reported
+ *  success and left a fragment anyway. */
+export function onClearResult(session: string, result: ParkedClearResult): void {
+  if (result === 'left-fragment') noteMachineFragmentLeft(session)
+}
+
+/** The only safe moment to forget: the box is OBSERVED empty.
+ *
+ *  That is also the only moment a human draft can begin, which is what keeps the
+ *  flag from being inherited by text a person typed. This single call is the
+ *  safety property of the change: without it a flag set once would make every
+ *  later hand-typed draft in the main pane count as machine-origin and eligible
+ *  for a hard restart. */
+export function onParkedState(session: string, parked: boolean): void {
+  if (!parked) clearMachineFragmentLeft(session)
+}
+
+// Pure. The capture-derived heuristic is authoritative when it FIRES; it is its
+// SILENCE that is unreliable, so our own record can only ever add machine-origin,
+// never take it away.
+export function resolveMachineOrigin(heuristic: boolean, leftByUs: boolean): boolean {
+  return heuristic || leftByUs
+}
+
 // Pure decision for the stuck-input restart escalation.
 //   'restart' -> soft recovery exhausted + input still parked + rate-limit ok
 //   'alert'   -> restarts are not clearing the wedge (cap reached) -> surface once
@@ -535,7 +605,7 @@ async function performStuckInputAction(
           // first (no-op when absent); an Enter on the then-idle prompt is
           // harmless.
           await dismissModelConsentDialogIfPresent(session)
-          execFileSync(tmuxBin(), ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
+          execFileSync(tmuxBin(), ['send-keys', '-t', exactTmuxTarget(session), 'Enter'], { timeout: 5000 })
         }
         submitted = true
         break
@@ -568,7 +638,10 @@ async function performStuckInputAction(
           logger.info({ session, attempt }, 'Stuck-input recovery (clear-preamble) skipped: a delivery is in flight into this pane (fail-closed)')
           break
         }
-        if (result === 'left-fragment') logger.warn({ session, attempt }, 'Stuck input -- clear-preamble left text in the box; the leftover stays parked')
+        onClearResult(session, result)
+        if (result === 'left-fragment') {
+          logger.warn({ session, attempt }, 'Stuck input -- clear-preamble left text in the box; the leftover stays parked (recorded as machine-origin)')
+        }
         break
       }
       case 'clear-scheduled': {
@@ -582,7 +655,10 @@ async function performStuckInputAction(
         // stops matching a delivery wrapper, so every later restart decision
         // reads it as a human draft. Say so in the log rather than reporting a
         // clean clear that did not happen.
-        if (result === 'left-fragment') logger.warn({ session, attempt }, 'Stuck input -- clear-scheduled left a fragment in the box; expect machineOrigin=false on the next tick')
+        onClearResult(session, result)
+        if (result === 'left-fragment') {
+          logger.warn({ session, attempt }, 'Stuck input -- clear-scheduled left a fragment in the box; recorded as machine-origin so the restart guard does not read it as a human draft')
+        }
         break
       }
       case 'enter':
@@ -590,7 +666,7 @@ async function performStuckInputAction(
         // Enter must never reach the model consent dialog (its default SWITCHES
         // the model). No-op when the dialog is absent.
         await dismissModelConsentDialogIfPresent(session)
-        execFileSync(tmuxBin(), ['send-keys', '-t', session, 'Enter'], { timeout: 5000 })
+        execFileSync(tmuxBin(), ['send-keys', '-t', exactTmuxTarget(session), 'Enter'], { timeout: 5000 })
         submitted = true
         break
       case 'hold':
@@ -770,7 +846,9 @@ export function readConfiguredMainModel(projectRoot: string = PROJECT_ROOT): str
     // fall through to the distribution default -- an unreadable settings file
     // must degrade the same way as a model-less one, never to a flag-less spawn
   }
-  return DISTRIBUTION_DEFAULT_AGENT_MODEL
+  // DEFAULTCLIGUARD927: same guard as channels.sh's third layer -- on a CLI
+  // measured not to run the shipped default, the previous tier.
+  return launchableDistributionDefaultSync('main')
 }
 
 // Secondary channel plugins the main session co-listens on, read from .env
@@ -781,9 +859,11 @@ export function readConfiguredMainModel(projectRoot: string = PROJECT_ROOT): str
 // Why this exists: a respawn that omits the extras comes up on the PRIMARY provider
 // only, which is a HALF-mute -- outbound still works (the plugin's MCP reply tool is
 // loaded) while inbound on every secondary provider is silently dropped ("server not
-// in --channels list"). Liveness probes watch the primary, so nothing looks wrong.
-// Observed in practice: a context-saturation hard restart dropped the secondary
+// in --channels list"). Liveness probes watched only the primary, so nothing looked
+// wrong. Observed in practice: a context-saturation hard restart dropped the secondary
 // inbound for ~20 minutes while the primary channel kept working normally.
+// Since BOOTSTAGGER1007 (b) the co-listen plugins are probed too
+// (checkMainColistenChannels / main-colisten-health.ts).
 export function readExtraChannelPluginIds(projectRoot: string = PROJECT_ROOT): string[] {
   return readEnvValue(projectRoot, 'CHANNEL_PLUGINS_EXTRA').split(/\s+/).filter(Boolean)
 }
@@ -839,9 +919,17 @@ export function buildMainSessionRespawnCmd(opts: {
    * and channel-watchdog.sh already export it; this is the third launcher.
    */
   channelStateEnv: { name: string; dir: string }
+  /**
+   * SLACKDMVESZT1006: the --settings file that ENABLES the extras for this
+   * session only (writeMainExtraPluginsSettings). Without it a recovery
+   * respawn lists the extras on --channels while the project scope keeps them
+   * disabled, and the extra bot comes up deaf. null/absent = no flag.
+   */
+  extraSettingsPath?: string | null
 }): string {
   return [
-    'export PATH="/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"',
+    // FLEETVENV923: same venv-first PATH as startAgentProcess and channels.sh.
+    `export PATH="${fleetVenvPathPrefix()}/opt/homebrew/bin:$HOME/.bun/bin:/home/linuxbrew/.linuxbrew/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"`,
     `&& export ${opts.channelStateEnv.name}=${shSingleQuote(opts.channelStateEnv.dir)}`,
     // MCP startup-batch tuning (parity with channels.sh + startAgentProcess):
     // the --channels plugin is a stdio MCP server; the main session runs the
@@ -855,6 +943,9 @@ export function buildMainSessionRespawnCmd(opts: {
     // CHANSPARE925: no Agent view -- parity with channels.sh (Left backgrounds the
     // session into the daemon, whose --channels copy takes the bot poller).
     '&& export CLAUDE_CODE_DISABLE_AGENT_VIEW=1',
+    // ROOTRESPAWN1001: the recovery respawn on a root host died with "cannot be used
+    // with root/sudo privileges" whenever the tmux server lacked IS_SANDBOX.
+    `&& ${ROOT_SANDBOX_ENV}`,
     // macOS main-agent config isolation -- parity with channels.sh CFG_ENV. The
     // token is read at launch via $(cat) so the secret never lands in argv/`ps`.
     // An own-credential dir (explicit or a rotated claude-plans entry) gets NO
@@ -883,6 +974,7 @@ export function buildMainSessionRespawnCmd(opts: {
     '&&', opts.claudePath,
     ...(opts.continueSession ? ['--continue'] : []),
     '--dangerously-skip-permissions',
+    ...(opts.extraSettingsPath ? ['--settings', shSingleQuote(opts.extraSettingsPath)] : []),
     // Escape the model id so a value like `claude-opus-4-8[1m]` is not
     // glob-expanded -- and so a hostile value cannot break out of the quote and
     // inject a command into the string the tmux respawn-pane shell runs. This is
@@ -934,6 +1026,7 @@ export function respawnMainSessionFresh(): void {
     claudePath: claudeBin(),
     pluginId: provider.pluginId,
     extraPluginIds: readExtraChannelPluginIds(),
+    extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, readExtraChannelPluginIds()),
     channelStateEnv: mainChannelStateEnv(provider.type),
     model: readConfiguredMainModel(),
     // The main session always starts a new conversation -- this is the whole
@@ -953,7 +1046,7 @@ export function respawnMainSessionFresh(): void {
   // paths drift apart. 'grace' means a launch is already in flight and the session is booting;
   // that is a success for our purposes (something IS coming up), not a failure to retry.
   if (mainChannelsSessionExists()) {
-    execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', MAIN_CHANNELS_SESSION, claudeCmd], { timeout: 15000 })
+    execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
   } else {
     const created = createMainChannelsSession()
     logger.warn({ session: MAIN_CHANNELS_SESSION, created },
@@ -1028,6 +1121,7 @@ export async function resumeMarveenSession(): Promise<boolean> {
       claudePath: claudeBin(),
       pluginId: provider.pluginId,
       extraPluginIds: readExtraChannelPluginIds(),
+    extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, readExtraChannelPluginIds()),
       channelStateEnv: mainChannelStateEnv(provider.type),
       model: readConfiguredMainModel(),
       continueSession: true,
@@ -1037,7 +1131,7 @@ export async function resumeMarveenSession(): Promise<boolean> {
       // preserving the prior shared-root behaviour.
       config: resolveMainConfigDecision(),
     })
-    execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', MAIN_CHANNELS_SESSION, claudeCmd], { timeout: 15000 })
+    execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
 
     // --continue replays the last conversation. When the prior session is large
     // (>200k tokens) Claude Code opens with a "Resume from summary" modal that
@@ -1150,11 +1244,32 @@ function fileRespawnStampMs(): number {
 }
 function writeRespawnStamp(): void {
   try {
-    writeFileSync(RESPAWN_STAMP_FILE, String(Math.floor(Date.now() / 1000)))
+    const value = String(Math.floor(Date.now() / 1000))
+    writeFileSync(RESPAWN_STAMP_FILE, value)
     // Attribution input for the external-respawn detector below: a stamp we
     // wrote ourselves must never be reported as an external actor.
     lastSelfStampWriteMs = Date.now()
+    lastSelfStampValue = value
   } catch { /* best effort */ }
+}
+// GAVEUPGRACE917: the exact stamp value our last stage-4 hard restart wrote,
+// so the gave_up branch can release that stamp -- and only that one -- once it
+// has settled (see respawn-stamp-release.ts).
+let lastSelfStampValue: string | null = null
+let ownHardRestartStamp: OwnRespawnStamp | null = null
+function noteOwnHardRestartStamp(at: number): void {
+  ownHardRestartStamp = lastSelfStampValue ? { value: lastSelfStampValue, at } : null
+}
+function tryReleaseOwnRespawnStamp(now: number): void {
+  if (!ownHardRestartStamp) return
+  const result = releaseOwnRespawnStamp(RESPAWN_STAMP_FILE, ownHardRestartStamp, now, RESUME_GRACE_MS)
+  if (result === 'settling') return // retried on the next gave_up tick
+  ownHardRestartStamp = null
+  if (result === 'release') {
+    logger.warn('Respawn grace released -- the independent channel-watchdog may act on its next tick (GAVEUPGRACE917)')
+  } else {
+    logger.info({ result }, 'Respawn grace not released: the stamp is not this monitor\'s hard-restart stamp (GAVEUPGRACE917)')
+  }
 }
 
 // --- external-respawn detector (SOAKRESPAWN819) ---
@@ -1225,7 +1340,7 @@ export function mainChannelsSessionExists(): boolean {
     // TMUXWINDOWATTR920: stderr piped -- a missing session is an ANSWER here
     // (false), not an error, so it is logged at debug with the call site rather
     // than copied undated onto dashboard.error.log.
-    execFileSync(tmuxBin(), ['has-session', '-t', MAIN_CHANNELS_SESSION], { timeout: 3000, stdio: ['ignore', 'pipe', 'pipe'] })
+    execFileSync(tmuxBin(), ['has-session', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION)], { timeout: 3000, stdio: ['ignore', 'pipe', 'pipe'] })
     return true
   } catch (err) {
     logger.debug({ site: 'channel-monitor.mainChannelsSessionExists', session: MAIN_CHANNELS_SESSION, tmux: tmuxStderr(err) }, 'tmux has-session: absent')
@@ -1287,6 +1402,7 @@ function respawnMarveenSessionFresh(): boolean {
       claudePath: claudeBin(),
       pluginId: provider.pluginId,
       extraPluginIds: readExtraChannelPluginIds(),
+    extraSettingsPath: writeMainExtraPluginsSettings(PROJECT_ROOT, readExtraChannelPluginIds()),
       channelStateEnv: mainChannelStateEnv(provider.type),
       model: readConfiguredMainModel(),
       continueSession: false,
@@ -1295,7 +1411,7 @@ function respawnMarveenSessionFresh(): boolean {
       // itself or it 401s on the rotating macOS Keychain. null when off/no token.
       config: resolveMainConfigDecision(),
     })
-    execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', MAIN_CHANNELS_SESSION, claudeCmd], { timeout: 15000 })
+    execFileSync(tmuxBin(), ['respawn-pane', '-k', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), claudeCmd], { timeout: 15000 })
     logger.warn({ provider: provider.type }, 'Hard restart: marveen session respawned fresh (no --continue)')
     // Re-establish /rename on the fresh process (see note in resumeMarveenSession).
     // scheduleIdentitySetup only schedules delayed timers -> fire-and-forget.
@@ -1415,7 +1531,7 @@ export function launchdRestartTookEffect(before: number | null, after: number | 
 // message now goes through the logger with the call site and the session.
 function mainPaneClaudePid(): number | null {
   try {
-    const raw = execFileSync(tmuxBin(), ['list-panes', '-t', MAIN_CHANNELS_SESSION, '-F', '#{pane_pid}'],
+    const raw = execFileSync(tmuxBin(), ['list-panes', '-t', exactTmuxTarget(MAIN_CHANNELS_SESSION), '-F', '#{pane_pid}'],
       { timeout: 3000, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] })
     const pid = parseInt(raw.trim().split('\n')[0] ?? '', 10)
     return Number.isFinite(pid) && pid > 0 ? pid : null
@@ -1459,6 +1575,7 @@ export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
       logger.warn({ pidBefore, pidAfter }, `Hard restart: launchctl reload of com.${SERVICE_ID}.channels`)
       marveenLastHardRestart = Date.now()
       writeRespawnStamp() // coordinate with the systemd-timer watchdog
+      noteOwnHardRestartStamp(marveenLastHardRestart)
       return { ok: true }
     }
     logger.warn(
@@ -1482,9 +1599,22 @@ export function hardRestartMarveenChannels(): { ok: boolean; error?: string } {
   // leaving the server and all other sessions intact.
   if (respawnMarveenSessionFresh()) {
     marveenLastHardRestart = Date.now()
+    noteOwnHardRestartStamp(marveenLastHardRestart) // respawnMarveenSessionFresh wrote the stamp
     return { ok: true }
   }
   return { ok: false, error: 'hard restart failed: tmux respawn-pane failed' }
+}
+
+// 8c338dc4: the plan rotation's opt-in continue restart (POST /api/claude-plans/rotate with
+// "continue": true): resumeMarveenSession's --continue respawn instead of the fresh one above,
+// with the fresh one as the fallback. The steps and their order live in main-rotation-continue.ts.
+export function restartMainForRotationContinue(): Promise<ContinueRestartResult> {
+  return runMainContinueRestart({
+    stampConsent: stampFableOverageConsentSharedRoots,
+    resume: resumeMarveenSession,
+    fresh: hardRestartMarveenChannels,
+    warn: (message) => logger.warn(message),
+  })
 }
 
 // Escalate a main channel input that survived the full soft recovery to a hard
@@ -1495,6 +1625,7 @@ function maybeRestartWedgedMainChannel(state: StuckInputState): void {
   const parked = state.parkedSig !== null
   // A cleared input box ends the spell -> reset the escalation counter so the
   // next genuine wedge starts fresh (and a successful restart is not penalised).
+  onParkedState(MAIN_CHANNELS_SESSION, parked)
   if (!parked) { stuckRestartCount = 0; return }
   // Busy-guard: never hard-restart while the main pane is actively generating --
   // a parked <channel> block then is a busy session, not a wedge. See
@@ -1506,7 +1637,10 @@ function maybeRestartWedgedMainChannel(state: StuckInputState): void {
   // Deadlock carve-out facts: read from the ghost-stripped parked view (same
   // view the soft recovery uses) so a dim autocomplete hint never counts.
   const parkedView = paneState === 'typing' ? captureParkedInputView(MAIN_CHANNELS_SESSION) : null
-  const machineOrigin = parkedView != null && parkedMachineOriginInput(parkedView)
+  const machineOrigin = resolveMachineOrigin(
+    parkedView != null && parkedMachineOriginInput(parkedView),
+    hasMachineFragmentLeft(MAIN_CHANNELS_SESSION),
+  )
   // Same registry lookup recoverStuckInputForSession() already does for the
   // soft-recovery decision -- without it here, a scrolled parked fragment
   // that lost BOTH its recognisable prefix and every truncated-marker phrase
@@ -1842,12 +1976,25 @@ function checkMainKeepaliveStaleness(): void {
     if (loop.decision === 'hold-and-alert') {
       keepaliveLoopAlerted = true
       logger.warn({ ageMs, uselessRespawns: loop.uselessRespawns }, 'Keepalive loop breaker: respawns did not advance the keepalive while the poller is alive -- holding further respawns (KEEPALIVELOOP923)')
-      sendAlert(`⚠️ A fő channel keep-alive ${ageMin} perce nem frissül, de a Telegram-poller él, és ${loop.uselessRespawns} újraindítás sem segített. További újraindítást NEM csinálok (csak a beszélgetést vinné el). Valószínűleg a jelző-forrás akadt el: nézd meg a com.marveen.channel-keepalive-probe launchd jobot és a store/channel-keepalive-probe.log-ot. Ha a jelző újra frissül, a figyelő magától visszaáll.`)
+      sendAlert(`⚠️ A fő channel keep-alive ${ageMin} perce nem frissül, de a Telegram-poller él, és ${loop.uselessRespawns} újraindítás sem segített. További újraindítást NEM csinálok (csak a beszélgetést vinné el). Valószínűleg a jelző-forrás akadt el: nézd meg a com.${SERVICE_ID}.channel-keepalive-probe launchd jobot és a store/channel-keepalive-probe.log-ot. Ha a jelző újra frissül, a figyelő magától visszaáll.`)
     }
     return
   }
-  logger.warn({ ageMs, paneState }, 'Channel keep-alive stale -- main session likely wedged/deaf, respawning via respawn-pane')
-  sendRoutineAlert('keepalive-respawn', `⚠️ A fő channel keep-alive ${ageMin} perce nem frissült -- respawn-pane a ${MAIN_CHANNELS_SESSION} session-on (a beszelgetes elveszik, memoria marad).`)
+  // SLEEP GUARD (2026-09-02, kanban 83b8c4c3): a keepalive that went stale
+  // because the machine was asleep is not deafness -- every writer of that
+  // file was suspended right along with the poller. The respawn below still
+  // runs (harmless self-healing, it re-establishes the keepalive), but the
+  // Telegram alert is suppressed: waking the machine should not ping the owner
+  // about an "outage" they caused by closing the lid. The staleness window is
+  // exactly [mtime, now], so a sleep gap overlapping it explains the age.
+  // Genuine wedge-while-running has no sleep gap in that window and alerts
+  // as before. The loop-breaker alert above is NOT gated: a respawn loop is a
+  // real fault whatever the clock did.
+  const staleDueToSleep = ageMs != null && systemSleptBetween(now - ageMs, now)
+  logger.warn({ ageMs, paneState, staleDueToSleep }, 'Channel keep-alive stale -- main session likely wedged/deaf, respawning via respawn-pane')
+  if (!staleDueToSleep) {
+    sendRoutineAlert('keepalive-respawn', `⚠️ A fő channel keep-alive ${ageMin} perce nem frissült -- respawn-pane a ${MAIN_CHANNELS_SESSION} session-on (a beszelgetes elveszik, memoria marad).`)
+  }
   keepaliveMtimeAtLastRespawn = keepaliveMtimeMs
   if (respawnMarveenSessionFresh()) {
     marveenLastKeepaliveRespawn = now
@@ -1980,16 +2127,51 @@ async function handleMarveenDown(): Promise<void> {
     // denied" when the operator is running it from another tmux session. Prefix
     // with `unset TMUX` so the hint works in both nested and non-nested cases.
     sendAlert(`🚨 Hard restart SEM segitett. Kezzel kell megnezni: \`unset TMUX && tmux attach -t ${MAIN_CHANNELS_SESSION}\` es ${serviceCmd}.`)
+    // Hand the channel to the independent backstops instead of holding them off
+    // with the stamp of a hard restart that did not work -- our own stamp only,
+    // and only after its settle time (retried on later gave_up ticks).
+    tryReleaseOwnRespawnStamp(now)
     return
   }
+  if (marveenDownState.stage === 'gave_up') tryReleaseOwnRespawnStamp(now)
   if (now - marveenDownState.lastAlertAt > PLUGIN_ALERT_DEDUP_MS) {
     marveenDownState.lastAlertAt = now
     sendAlert(`🚨 ${BOT_NAME} ${providerLabel} plugin meg mindig halott. Nezd meg kezzel.`)
   }
 }
 
+// BOOTSTAGGER1007 (b): the co-listen plugins of the main session (see
+// main-colisten-health.ts). One state per provider, for the dashboard's life.
+const colistenState = new Map<ChannelProviderType, ColistenState>()
+const ALL_PROVIDER_TYPES: ChannelProviderType[] = ['telegram', 'slack', 'discord', 'googlechat', 'teams']
+
+// Called on every sweep where the main session's PRIMARY plugin is alive (a
+// dead primary is the down-cascade's job, and a restart from here would race it).
+async function checkMainColistenChannels(claudePid: number): Promise<void> {
+  const primary = getMainAgentProvider()
+  const extras = colistenProviders(primary, readExtraChannelPluginIds(), ALL_PROVIDER_TYPES.map((t) => getProvider(t)))
+  if (extras.length === 0) return
+  await runColistenCheck({
+    primary,
+    extras,
+    // strictTree: only a plugin inside the MAIN claude's tree counts. The
+    // default probe falls back to "any Slack poller on the host", and every
+    // Slack sub-agent runs one (#1762 review).
+    probe: (p) => probeChannelPluginLiveness(claudePid, p, undefined, { strictTree: true }),
+    now: Date.now(),
+    lastRespawnAt: lastMainRespawnAt(),
+    respawnGraceMs: MARVEEN_POST_RESPAWN_GRACE_MS,
+    state: colistenState,
+    alert: sendAlert,
+    log: (level, fields, msg) => logger[level](fields, msg),
+    restart: () => resumeMarveenSession(),
+    botName: BOT_NAME,
+  })
+}
+
 function handleMarveenUp(): void {
   marveenSuspectFirstSeen = null
+  ownHardRestartStamp = null // recovered: the stamp is no longer ours to release
   if (marveenDownState) {
     const downedFor = Math.round((Date.now() - marveenDownState.downSince) / 1000)
     const stage = marveenDownState.stage
@@ -2033,6 +2215,10 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
   // per-agent spawn path never reaches, so an already-running unstamped install
   // heals on the next dashboard boot instead of never.
   try { stampFableOverageConsentSharedRoots() } catch { /* backstop handlers remain */ }
+
+  // Sleep/wake detection for the keepalive-staleness alert suppression
+  // (idempotent; the schedule runner starts it too, whichever runs first wins).
+  startSleepWakeDetector()
 
   const mainProvider = getMainAgentProvider()
 
@@ -2201,7 +2387,7 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           } else {
             logger.warn({ session: t.session, agent: label }, 'Session parked in a blocking interactive menu -- sending Escape to recover')
             try {
-              execFileSync(tmuxBin(), ['send-keys', '-t', t.session, 'Escape'], { timeout: 5000 })
+              execFileSync(tmuxBin(), ['send-keys', '-t', exactTmuxTarget(t.session), 'Escape'], { timeout: 5000 })
             } catch (err) {
               logger.warn({ err, session: t.session }, 'Menu-recovery Escape failed')
             }
@@ -2306,6 +2492,8 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
           // Process-alive does NOT prove the inbound MCP pipe is healthy (the
           // deafness blind spot). Cross-check the keep-alive freshness.
           checkMainKeepaliveStaleness()
+          // BOOTSTAGGER1007 (b): the primary is alive -- now the co-listen ones.
+          await checkMainColistenChannels(claudePid)
         } else {
           if (agentDownSince.has(t.session)) {
             logger.info({ session: t.session, provider: t.provider }, 'Agent channel plugin recovered')
@@ -2585,12 +2773,32 @@ export function startChannelPluginMonitor(): NodeJS.Timeout | null {
   return setInterval(() => { void check() }, 60000)
 }
 
-// Start desired-but-missing agents one at a time (~15s apart). The stagger is
-// mandatory: starting several channel agents at once makes them all die in the
+// Start desired-but-missing agents one at a time. The stagger is mandatory:
+// starting several channel agents at once makes them all die in the
 // resume-from-summary modal race. A single in-flight burst at a time.
+// BOOTSTAGGER1007 (c): the main session first, then one agent at a time by
+// readiness (or a quiet box), bounded -- see reconcile-stagger.ts.
 let reconcileBurstInProgress = false
-const AGENT_RECONCILE_STAGGER_MS = 15000
 function delay(ms: number): Promise<void> { return new Promise((r) => setTimeout(r, ms)) }
+const monitorModuleLoadedAt = Date.now()
+let mainFirstWaitLogged = false
+
+/** The main session is up for the owner: its primary channel plugin and every co-listen plugin are alive. */
+function mainSessionChannelsReady(): boolean {
+  const claudePid = getClaudePidForSession(MAIN_CHANNELS_SESSION)
+  if (claudePid == null) return false
+  const primary = getMainAgentProvider()
+  if (probeChannelPluginLiveness(claudePid, primary) !== 'alive') return false
+  const extras = colistenProviders(primary, readExtraChannelPluginIds(), ALL_PROVIDER_TYPES.map((t) => getProvider(t)))
+  // strictTree: a Slack sub-agent's plugin must not stand in for the main
+  // session's own (the #1762 review finding).
+  return extras.every((p) => probeChannelPluginLiveness(claudePid, p, undefined, { strictTree: true }) === 'alive')
+}
+
+function loadPerCpu(): number | null {
+  const n = cpus().length
+  return n > 0 ? loadavg()[0] / n : null
+}
 
 // --- Commit 3 v1: fleet memory gate (safe-mode) ---
 // Before starting a desired-but-down agent, ask scripts/fleet-memory-gate.sh
@@ -2626,33 +2834,36 @@ async function reconcileDesiredAgents(): Promise<void> {
   if (down.length === 0) return
   reconcileBurstInProgress = true
   try {
-    for (const name of down) {
-      if (isAgentRunning(name)) continue
-      // A managed restart (context guard, auto-restart, model fallback, the
-      // dashboard button) is stop+start, and isAgentRunning() reports false for
-      // the ~2s the stop spends waiting on tmux. Starting the agent in that
-      // window does not heal a crash -- it overtakes the restarter and boots
-      // the agent with OUR options instead of theirs (default = --continue,
-      // which is exactly what a saturation rescue is trying to drop). The two
-      // loops are phase-locked, so this is not a rare interleaving: see
-      // restart-lock.ts for the measured levente case.
-      if (isRestartInFlight(name)) {
-        logger.info({ agent: name }, 'Reconcile: managed restart in flight -- leaving the start to it')
-        continue
+    // BOOTSTAGGER1007 (c): the gate, the skips and the readiness gap live in
+    // runReconcileBurst (reconcile-stagger.ts), behaviour-tested there.
+    const { gate } = await runReconcileBurst({
+      down,
+      isDesired: (name) => getDesiredAgents().has(name),
+      mainReady: mainSessionChannelsReady,
+      msSinceMonitorStart: Date.now() - monitorModuleLoadedAt,
+      isAgentRunning,
+      isRestartInFlight,
+      isWithinRestartGrace,
+      memGateAllowsStart,
+      start: (name) => startAgentProcess(name),
+      afterStart: (name) => { agentLastRestart.set(name, Date.now()) },
+      gap: (name) => waitReconcileGap({
+        now: Date.now,
+        sleep: delay,
+        // saturationLog 'debug': a saturated fresh agent is polled every 3 s
+        // here; the refusal is not news on every poll (#1764 review).
+        isReady: () => isSessionReadyForPrompt(agentSessionName(name), null, { saturationLog: 'debug' }),
+        loadPerCpu,
+      }),
+      log: (level, fields, msg) => logger[level](fields, msg),
+    })
+    if (gate === 'wait') {
+      if (!mainFirstWaitLogged) {
+        logger.info({ pending: down, maxWaitMs: RECONCILE_MAIN_FIRST_MAX_WAIT_MS }, 'Reconcile: waiting for the main session\'s channels before starting sub-agents')
+        mainFirstWaitLogged = true
       }
-      if (isWithinRestartGrace(name)) continue
-      if (!memGateAllowsStart(name)) continue   // Commit 3 v1: safe-mode / memory gate
-      logger.warn({ agent: name }, 'Desired agent not running -- auto-starting (reconcile)')
-      try {
-        const r = await startAgentProcess(name)
-        agentLastRestart.set(name, Date.now())
-        if (!r.ok && r.error !== 'Agent is already running') {
-          logger.error({ agent: name, error: r.error }, 'Reconcile start failed')
-        }
-      } catch (err) {
-        logger.error({ err, agent: name }, 'Reconcile start threw')
-      }
-      await delay(AGENT_RECONCILE_STAGGER_MS)
+    } else {
+      mainFirstWaitLogged = false
     }
   } finally {
     reconcileBurstInProgress = false

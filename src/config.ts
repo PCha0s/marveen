@@ -1,9 +1,10 @@
 import { CronExpressionParser } from 'cron-parser'
-import { hostname } from 'node:os'
+import { hostname, homedir } from 'node:os'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { readEnvFile } from './env.js'
+import { resolveFleetVenvDir } from './fleet-venv.js'
 import { DISTRIBUTION_DEFAULT_AGENT_MODEL } from './config-registry.js'
 import { getProviderType, getChannelToken, getChannelChatId, type ChannelProviderType } from './channel-provider.js'
 
@@ -112,6 +113,11 @@ export const APP_TZ_INVALID = appTz.invalid
 // reconfigures a running fleet.
 export const DEFAULT_AGENT_MODEL =
   cfg('DEFAULT_AGENT_MODEL') || DISTRIBUTION_DEFAULT_AGENT_MODEL
+// DEFAULTCLIGUARD927: true when no operator configured DEFAULT_AGENT_MODEL, so
+// the value above is the SHIPPED default. Only then may a launch swap it for
+// the previous tier on a CLI that cannot run it (default-model-guard.ts); a
+// configured value is the operator's choice and is never replaced.
+export const DEFAULT_AGENT_MODEL_IS_DISTRIBUTION = !cfg('DEFAULT_AGENT_MODEL')
 
 export const TELEGRAM_BOT_TOKEN = env['TELEGRAM_BOT_TOKEN'] ?? ''
 export const ALLOWED_CHAT_ID = env['ALLOWED_CHAT_ID'] ?? ''
@@ -161,6 +167,16 @@ export const BRAND_NAME = env['BRAND_NAME'] ?? BOT_NAME
 // not change that; the token remains the actual boundary.
 export const SYSTEM_SENDER_IDS = env['SYSTEM_SENDER_IDS'] ?? ''
 
+// Card 795d1f48 (a): the enrolled device keys that may send an URGENT row over POST /api/messages (a row the router
+// types into a BUSY pane), by their numeric ids (GET /api/auth/device-keys lists them). Install-specific, so .env, and
+// empty by default: with no id, no HTTP caller may set urgent; the in-process writers are not affected. A device key
+// alone is not enough because the shared dashboard token can mint one; and the list is deliberately not in the
+// settings registry, so the dashboard's settings page does not edit it. Device key ids are AUTOINCREMENT: a revoked
+// key's id is never handed out again. Comma-separated:
+//   MESSAGE_URGENT_DEVICE_IDS=7
+// Read at module load -- a change needs a dashboard restart.
+export const MESSAGE_URGENT_DEVICE_IDS = env['MESSAGE_URGENT_DEVICE_IDS'] ?? ''
+
 // Pure parse rule for SYSTEM_SENDER_IDS, so the default (unset => empty set) is
 // provable without a live .env. Entries are normalized with the SAME function
 // the route matches on, keeping this guard symmetric with the coordinator and
@@ -172,6 +188,18 @@ export function parseSystemSenderIds(raw: string | undefined, normalize: (s: str
       .split(',')
       .map(s => normalize(s.trim()))
       .filter(Boolean)
+  )
+}
+
+// Pure parse rule for MESSAGE_URGENT_DEVICE_IDS: positive integers only. Anything else is dropped, never read
+// generously: a typo or an empty value means nobody.
+export function parseDeviceKeyIds(raw: string | undefined): Set<number> {
+  return new Set(
+    (raw ?? '')
+      .split(',')
+      .map(s => s.trim())
+      .filter(s => /^[1-9][0-9]{0,14}$/.test(s))
+      .map(Number)
   )
 }
 
@@ -291,6 +319,25 @@ export const WEB_PORT = parseInt(env['WEB_PORT'] ?? '3420', 10)
 
 export const WEB_HOST = env['WEB_HOST'] ?? '127.0.0.1'
 
+// How long a fired scheduled task may stay busy before the watchdog calls it
+// stuck (default 45 minutes; `stuckAfterMinutes` still overrides it per task).
+//
+// A key rather than a literal for the same reason as DEFAULT_AGENT_MODEL: this
+// number is an OPERATOR judgement, not an engineering constant. Whether "still
+// running after N minutes" means trouble depends on what the install's tasks
+// do, and an install that raises it has to keep raising it after every update
+// if the only way to say so is patching src/. That is not hypothetical -- one
+// install set 10 minutes because 5 produced false "possible hang" alerts, and
+// lost the setting to an update, silently: alerts simply got eager again.
+// .env survives updates, src/ does not.
+export const TASK_STALL_TIMEOUT_MS = (() => {
+  const parsed = parseInt(env['TASK_STALL_TIMEOUT_MS'] ?? '', 10)
+  // A malformed or absurd value must not disable the watchdog outright, so an
+  // out-of-range setting falls back to the default instead of being clamped
+  // into silence.
+  return Number.isFinite(parsed) && parsed >= 60_000 ? parsed : 2_700_000
+})()
+
 // Kanban card aging visual thresholds (hours since last update) and colours.
 // Override per-install via .env; defaults match the design spec (24/72/168h).
 export const KANBAN_AGING_WARN_H = parseInt(env['KANBAN_AGING_WARN_H'] ?? '24', 10)
@@ -332,6 +379,19 @@ export const DASHBOARD_PUBLIC_URL = cfg('DASHBOARD_PUBLIC_URL') ?? ''
 // the other cannot be correct for both deployment shapes, so it is its own key.
 // Empty preserves the previous behaviour exactly (public URL, else localhost).
 export const AGENT_API_ORIGIN = cfg('AGENT_API_ORIGIN') ?? ''
+
+// FLEETVENV923: the fleet's shared Python virtualenv. When `<dir>/bin` exists it
+// is prepended to every agent launch PATH (sub-agents via startAgentProcess,
+// the main session via channels.sh and the recovery relaunch in
+// channel-monitor.ts), so a skill's plain `python3` and the venv's own CLIs
+// (markitdown, ...) resolve to the venv without per-skill interpreter paths.
+// Measured 2026-09-23 on the Mac mini: the Homebrew python3 carried zero
+// packages, so every skill `python3` call import-failed while a venv with the
+// packages sat next to it. A `~` prefix means the home directory; the default
+// is EMPTY (off), and a nonexistent directory disables the prefix too.
+// Resolved by fleet-venv.ts, the same function channels.sh reaches through
+// scripts/fleet-venv-prefix.mjs, so the two launch paths cannot disagree.
+export const FLEET_PYTHON_VENV = resolveFleetVenvDir(PROJECT_ROOT, homedir(), process.env.CLAUDECLAW_ENV_DIR ?? PROJECT_ROOT)
 // Extra browser origins allowed to make state-changing dashboard requests
 // (CORS + CSRF allowlist), comma-separated, e.g. for VPN/LAN addresses that
 // aren't covered by WEB_HOST or DASHBOARD_PUBLIC_URL. Empty by default so
@@ -366,6 +426,14 @@ export const KANBAN_LABEL_COLORS = rawKanbanLabelColors.length > 0 ? rawKanbanLa
 export const CHANNEL_PROVIDER: ChannelProviderType = getProviderType(env['CHANNEL_PROVIDER'])
 export const CHANNEL_TOKEN = getChannelToken(CHANNEL_PROVIDER, env)
 export const CHANNEL_CHAT_ID = getChannelChatId(CHANNEL_PROVIDER, env)
+// Where OPERATIONAL alerts go (watchdog respawns, stuck sessions, restart
+// notices). Empty = the owner chat; set it when the person who runs the
+// system is not the owner, so the owner is not flooded with plumbing noise.
+// Owner-facing content (heartbeat digest, security events) ignores it.
+export function resolveAlertChatIdSetting(e: Record<string, string | undefined>): string {
+  return (e['MARVEEN_ALERT_CHAT_ID'] || e['ALERT_CHAT_ID'] || '').trim()
+}
+export const ALERT_CHAT_ID = resolveAlertChatIdSetting(env)
 
 // Respawn / keep-alive gate.
 // The in-process channel-plugin monitor (main-agent respawn + sub-agent
@@ -423,6 +491,15 @@ export const SUBAGENT_INBOX_TEE =
 // with SUBAGENT_TELEGRAM_WAKE_ENABLED=1 (alongside SUBAGENT_INBOX_TEE=1).
 export const SUBAGENT_TELEGRAM_WAKE_ENABLED =
   ['1', 'true', 'yes', 'on'].includes((cfg('SUBAGENT_TELEGRAM_WAKE_ENABLED') ?? '').trim().toLowerCase())
+
+// Install-wide default for router-side speech-to-text on inbound voice notes
+// (opt-in, DEFAULT OFF). Agents in responseMode 'voice'/'auto' are always
+// transcribed; this only decides what happens for text-mode agents that do not
+// set voice.transcribeInbound in their agent-config.json. Enable with
+// VOICE_TRANSCRIBE_INBOUND=1 to run faster-whisper on every inbound voice note
+// for every such agent. Read at boot: takes effect after a dashboard restart.
+export const VOICE_TRANSCRIBE_INBOUND =
+  ['1', 'true', 'yes', 'on'].includes((cfg('VOICE_TRANSCRIBE_INBOUND') ?? '').trim().toLowerCase())
 
 // Google Calendar account the heartbeat summarises (next 2h). Empty (the
 // default) means the agent uses whatever calendar its MCP server is
