@@ -35,19 +35,25 @@
 // Scope, main session: detect AND recover (respawn-pane), as above.
 //
 // Scope, sub-agents (SUBWAIT925, card c3f8f062): detect and ALERT only, never
-// recover. The case materialised on 2026-09-23: a sub-agent in a strict
-// permission profile sat on an approval dialog (a held cross-session message)
-// for hours, and nothing told the owner -- this watcher was main-only, the
-// channel-monitor's menu pass only walks channel-owning agents and does not
+// recover, never a keystroke. The case materialised on 2026-09-23: a sub-agent
+// in a strict permission profile sat on an approval dialog (a held cross-session
+// message) for hours, and nothing told the owner -- this watcher was main-only,
+// the channel-monitor's menu pass only walks channel-owning agents and does not
 // recognise that dialog, and the router's session-stuck alert needs QUEUED
 // inter-agent messages, which a cross-session send never leaves behind. Every
-// running sub-agent is now swept for three waiting shapes: a tool-permission
-// prompt, a held peer message, and a stagnant tool-call counter. A waiting
-// prompt is a QUESTION, not a wedge: the alert says who is waiting and what
-// it asks, and never sends a keystroke (Escape would answer "no"). A stagnant
-// counter on a sub-agent is reported, not respawned: the respawn path
-// (stopAgentProcess + startAgentProcess) discards the agent's working memory,
-// so that decision stays with a person or the orchestrator.
+// running sub-agent is now swept for two WAITING shapes:
+//   - a held peer message: on every sub-agent;
+//   - a tool-permission prompt: only on sub-agents WITHOUT a channel. For a
+//     channel-owning agent the channel-monitor's menu pass already alerts the
+//     owner on that prompt (45 s confirm, 5 min dedup), so alerting here too
+//     sent two messages for one prompt (#1596 review, point 1).
+// A waiting prompt is a QUESTION, not a wedge: the alert says who is waiting
+// and what it asks, and never sends a keystroke (Escape would answer "no").
+// A stagnant tool-call counter on a sub-agent is deliberately NOT watched here:
+// without the main path's transcript-freshness and CPU guards it reads a
+// residual "Worked for Ns" summary above a working turn as a wedge (#1596
+// review, point 2). That half follows separately, with a per-agent
+// transcript-mtime guard.
 
 import { execFileSync } from 'node:child_process'
 import { logger } from '../logger.js'
@@ -56,7 +62,7 @@ import { resolveFromPath } from '../platform.js'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { PROJECT_ROOT, STORE_DIR } from '../config.js'
-import { capturePane, isAgentRunning, agentSessionName } from './agent-process.js'
+import { capturePane, isAgentRunning, agentSessionName, agentHasChannel } from './agent-process.js'
 import { listAgentNames, readAgentRemoteHost } from './agent-config.js'
 import { readTranscriptMtimeAcrossConfigDirs } from './active-model.js'
 import { mainConfigRoots } from './inbound-probe.js'
@@ -550,30 +556,22 @@ export function formatAgentWaitAlert(
   return `⏸️ A(z) ${agent} ágens ${min} perce egy tool-engedélykérésre vár.${what} Nem hiba: a session él, egy igen/nem kérdés áll a bemenet előtt, és azt csak ember válaszolhatja meg. Nem nyomtam meg semmit (az Escape ott NEM-et jelentene). Döntsd el: tmux attach -t ${session}`
 }
 
-export function formatAgentStuckAlert(agent: string, session: string, state: StuckToolCallState, thresholds: StuckToolCallThresholds): string {
-  return `🔧 A(z) ${agent} ágens tool-hívása beragadt: a kijelző számlálója ${Math.round(state.lastSeconds ?? 0)}s-nál megállt, és több mint ${thresholds.freezeSeconds}s-ig nem mozdult. NEM indítottam újra automatikusan (az eldobná a futó munkáját). Nézd meg: tmux attach -t ${session}; ha tényleg beragadt, a dashboardról indítsd újra.`
-}
-
 export interface SubAgentSweepDeps {
   listAgents: () => string[]
   isRunning: (agent: string) => boolean
+  /** The agent owns a channel: its permission prompts are the channel-monitor's to report. */
+  hasChannel: (agent: string) => boolean
   capture: (agent: string, session: string) => string | null
   now: () => number
   alertWait: (agent: string, session: string, kind: AgentWaitKind, waitingMs: number, ask: PermissionPromptSummary | null) => void
-  alertStuck: (agent: string, session: string, state: StuckToolCallState) => void
   waitThresholds?: PaneErrorAlertThresholds
-  stuckThresholds?: StuckToolCallThresholds
 }
 
-// Per-agent state. Waiting spells and stagnant-counter spells are tracked
-// separately: a session can show a frozen residual counter above a fresh
-// permission prompt, and the prompt must win (it is the actionable fact).
+// Per-agent waiting-spell state.
 const agentWaitState = new Map<string, PaneErrorAlertState>()
-const agentStuckState = new Map<string, StuckToolCallState>()
 
 export function resetSubAgentWatchState(): void {
   agentWaitState.clear()
-  agentStuckState.clear()
 }
 
 // One sweep over every running sub-agent. Pure apart from the injected deps,
@@ -581,7 +579,6 @@ export function resetSubAgentWatchState(): void {
 // one agent's sake: a capture failure on one session must not skip the rest.
 export function sweepSubAgents(deps: SubAgentSweepDeps): void {
   const waitThresholds = deps.waitThresholds ?? AGENT_WAIT_THRESHOLDS
-  const stuckThresholds = deps.stuckThresholds ?? THRESHOLDS
   let agents: string[]
   try {
     agents = withoutMainAgent(deps.listAgents())
@@ -598,8 +595,11 @@ export function sweepSubAgents(deps: SubAgentSweepDeps): void {
       const pane = deps.capture(agent, session)
       const now = deps.now()
 
-      // 1. Waiting on a person (permission prompt / held peer message).
-      const kind = classifyAgentWait(pane)
+      // Waiting on a person (permission prompt / held peer message). A
+      // permission prompt on a channel-owning agent is the channel-monitor's
+      // (one owner per state, #1596 review point 1).
+      let kind = classifyAgentWait(pane)
+      if (kind === 'permission' && deps.hasChannel(agent)) kind = null
       const prevWait = agentWaitState.get(agent) ?? { firstSeenAt: null, lastAlertAt: null, lastErrorAt: null }
       const wait = decidePaneErrorAlert(kind != null, prevWait, now, waitThresholds)
       if (wait.next.firstSeenAt === null) agentWaitState.delete(agent)
@@ -609,51 +609,24 @@ export function sweepSubAgents(deps: SubAgentSweepDeps): void {
         logger.warn({ agent, session, kind, waitingMs: now - (wait.next.firstSeenAt ?? now) }, 'stuck-tool-call-watcher: sub-agent is waiting on a person (no keystrokes sent) -- alerting')
         deps.alertWait(agent, session, kind, now - (wait.next.firstSeenAt ?? now), ask)
       }
-      if (kind != null) {
-        // A prompt replaces the working indicator, so a counter spell cannot
-        // be observed meanwhile; drop it rather than let it go stale.
-        agentStuckState.delete(agent)
-        continue
-      }
-
-      // 2. Stagnant tool-call counter: report only, never respawn.
-      const sig = pane == null ? null : stuckToolCallSignature(pane)
-      const prevStuck = agentStuckState.get(agent) ?? NO_STATE
-      const { recover, next } = decideStuckToolCallRecovery(sig, prevStuck, now, stuckThresholds)
-      if (next.tag === null) agentStuckState.delete(agent)
-      else agentStuckState.set(agent, next)
-      if (!recover) continue
-      // Same residual-footer and parked-input guards as the main path: an
-      // idle prompt or machine-injected input means the session is not wedged.
-      if (pane != null && (detectPaneState(pane) === 'idle' || parkedChannelInput(pane) != null || parkedMachineOriginInput(pane))) {
-        agentStuckState.delete(agent)
-        continue
-      }
-      logger.warn({ agent, session, tag: next.tag, seconds: next.lastSeconds, spellPeakSeconds: next.spellPeakSeconds, stagnantPolls: next.stagnantPolls }, 'stuck-tool-call-watcher: sub-agent TUI counter stagnant past freeze threshold -- alerting (no recovery for sub-agents)')
-      deps.alertStuck(agent, session, next)
-      // One report per spell: the routine-alert cooldown throttles repeats,
-      // and a fresh spell (the counter moves and freezes again) re-arms.
-      agentStuckState.delete(agent)
     } catch (err) {
       logger.debug({ err, agent }, 'stuck-tool-call-watcher: sub-agent check error')
     }
   }
   // Forget agents that stopped, so a restart begins with a clean spell.
-  for (const key of [...agentWaitState.keys(), ...agentStuckState.keys()]) {
-    if (!seen.has(key)) { agentWaitState.delete(key); agentStuckState.delete(key) }
+  for (const key of [...agentWaitState.keys()]) {
+    if (!seen.has(key)) agentWaitState.delete(key)
   }
 }
 
 const LIVE_SUB_AGENT_DEPS: SubAgentSweepDeps = {
   listAgents: listAgentNames,
   isRunning: isAgentRunning,
+  hasChannel: agentHasChannel,
   capture: (agent, session) => capturePane(session, readAgentRemoteHost(agent)),
   now: () => Date.now(),
   alertWait: (agent, session, kind, waitingMs, ask) => {
     sendRoutineAlert(`agent-wait:${agent}`, formatAgentWaitAlert(agent, session, kind, waitingMs, ask))
-  },
-  alertStuck: (agent, session, state) => {
-    sendRoutineAlert(`agent-stuck-tool-call:${agent}`, formatAgentStuckAlert(agent, session, state, THRESHOLDS))
   },
 }
 

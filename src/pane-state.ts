@@ -607,6 +607,12 @@ export function detectsBlockingMenu(pane: string): boolean {
   const footerRegion = liveTailRegion(lines, MENU_FOOTER_REGION_LINES)
   if (BUSY_ESC_TO_INTERRUPT_RX.test(footerRegion)) return false
   if (hasIdleFooter(lines)) return false
+  // A held cross-session message is a QUESTION for a person, not a stray
+  // modal: Escape there is not a neutral "back" -- it may decline the message
+  // and tell the sender so (the dialog's Deny: "drop it and tell the sender it
+  // was declined"). Never treat it as a menu to pop; the sub-agent sweep
+  // (stuck-tool-call-watcher.ts) alerts the owner instead (#1596 review).
+  if (detectsHeldPeerMessage(pane)) return false
   return MENU_NAV_RX.test(footerRegion) || MENU_ESC_RX.test(footerRegion)
 }
 
@@ -1041,13 +1047,18 @@ export function detectsPermissionDialog(pane: string): boolean {
 // Measured on 2026-09-23 on this install: kigyo's session sat on one for hours
 // with no alert -- detectsPermissionDialog does not match it, and the router's
 // session-stuck path only fires when inter-agent messages are QUEUED for the
-// session, which a cross-session send never is. The phrases below are the
-// dialog's own strings, taken from the installed Claude Code binary (2.1.x):
-// "A message from another session needs your approval", "Another Claude
-// session sent a message", "Held message from another session". Same guards
-// as detectsPermissionDialog: a busy pane is never a dialog, and a visible
-// idle footer means the prompt is live and the phrase is merely quoted.
-const HELD_PEER_MESSAGE_RX = /A message from another session needs your approval|Another Claude session sent a message|Held message from another session|approve message from another session/i
+// session, which a cross-session send never is.
+//
+// The anchor is the dialog's rendered TITLE, "Held message from another
+// session" (#1596 review: `title:"Held message from another session"` in the
+// Claude Code 2.1.282 binary; still there in 2.1.296). The dialog's other
+// strings are deliberately not anchors: "Another Claude session sent a message"
+// also opens the model-facing wrapper of a DELIVERED peer message, and "A
+// message from another session needs your approval" is the notification text of
+// that state, not necessarily on screen. Same guards as detectsPermissionDialog:
+// a busy pane is never a dialog, and a visible idle footer means the prompt is
+// live and the title is merely quoted.
+const HELD_PEER_MESSAGE_RX = /Held message from another session/
 
 export function detectsHeldPeerMessage(pane: string): boolean {
   if (!pane || !pane.trim()) return false

@@ -1,20 +1,24 @@
-// SUBWAIT925 (card c3f8f062): a sub-agent parked on an approval dialog or on a
-// frozen tool-call counter must reach the owner as an alert. The 2026-09-23
-// incident: kigyo's strict-profile session held a cross-session message for
-// approval for hours; no watcher recognised that dialog, so nothing alerted.
-// These tests pin the detector for that dialog, the classification, and the
-// alert-only sweep (confirm window, dedup, clearing, never a keystroke).
+// SUBWAIT925 (card c3f8f062): a sub-agent parked on an approval dialog must
+// reach the owner as an alert. The 2026-09-23 incident: kigyo's strict-profile
+// session held a cross-session message for approval for hours; no watcher
+// recognised that dialog, so nothing alerted. These tests pin the detector for
+// that dialog (anchored on its title), the classification, the menu pass never
+// Escaping it, and the alert-only sweep (confirm window, dedup, clearing, one
+// owner per state, never a keystroke).
+//
+// #1596 review: the stagnant-counter half is not part of this change (it needs
+// a per-agent transcript-mtime guard first), and a permission prompt on a
+// channel-owning agent is the channel-monitor's to report.
 
 import { describe, it, expect, beforeEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { detectsHeldPeerMessage, detectsPermissionDialog, type StuckToolCallState } from '../pane-state.js'
+import { detectsHeldPeerMessage, detectsPermissionDialog, detectsBlockingMenu } from '../pane-state.js'
 import {
   classifyAgentWait,
   sweepSubAgents,
   resetSubAgentWatchState,
   formatAgentWaitAlert,
-  formatAgentStuckAlert,
   AGENT_WAIT_THRESHOLDS,
   type SubAgentSweepDeps,
 } from '../web/stuck-tool-call-watcher.js'
@@ -23,23 +27,27 @@ import { MAIN_AGENT_ID } from '../config.js'
 const load = (n: string) => readFileSync(join(__dirname, `fixtures/pane/${n}.txt`), 'utf8')
 const PERMISSION_PANE = load('permission-prompt-bash-grep')
 
-// The held-peer-message dialog, built from the dialog's own strings in the
-// installed Claude Code binary (2.1.x). The exact layout around them is not
-// pinned: the detector keys on the phrases, guarded by busy/idle checks.
+// The held-peer-message dialog. NOT a live capture: assembled from the
+// dialog's own strings in the installed Claude Code binary (checked in 2.1.282
+// by the reviewer and in 2.1.296 here): the title, the body lines, and the two
+// options "Deliver this message to Claude" / "Deny" ("drop it and tell the
+// sender it was declined"). The footer line is the generic modal hint, so the
+// pane is exactly the shape the channel-monitor's menu pass would Escape.
 const HELD_PEER_PANE = [
   '  Reviewed the branch, waiting for the next instruction.',
   '',
   '────────────────────────────────────────────────────────────────────────────────',
-  ' A message from another session needs your approval',
+  ' Held message from another session',
   '',
-  ' Another Claude session sent a message: from uds:/tmp/cc-socks/21286.sock (claims name: Klaudia)',
+  ' Another Claude session sent a message: from uds:/tmp/cc-socks/21286.sock (peer claims name: Klaudia)',
   '',
   ' Message body (this is what will be delivered):',
   ' │ Please rebase the PR onto develop.',
   '',
-  ' ❯ 1. Deliver',
-  '   2. Ignore',
+  ' ❯ 1. Deliver this message to Claude',
+  '   2. Deny  drop it and tell the sender it was declined',
   '',
+  ' Enter to confirm · Esc to cancel',
 ].join('\n')
 
 const IDLE_PANE = [
@@ -58,22 +66,39 @@ const busyPane = (seconds: number) => [
 ].join('\n')
 
 describe('detectsHeldPeerMessage', () => {
-  it('recognises the held cross-session message dialog', () => {
+  it('recognises the held cross-session message dialog by its title', () => {
     expect(detectsHeldPeerMessage(HELD_PEER_PANE)).toBe(true)
     // It is NOT the tool-permission card: that detector must stay quiet here.
     expect(detectsPermissionDialog(HELD_PEER_PANE)).toBe(false)
   })
-  it('stays quiet on a busy pane that merely echoes the phrase', () => {
+  it('the body strings alone are not an anchor (review: they appear outside the dialog too)', () => {
+    // The wrapper of a DELIVERED peer message opens with the same sentence.
+    const delivered = HELD_PEER_PANE.replace(' Held message from another session', ' (delivered)')
+    expect(detectsHeldPeerMessage(delivered)).toBe(false)
+    // The notification text of the state is not necessarily on screen.
+    expect(detectsHeldPeerMessage(' A message from another session needs your approval\n Esc to cancel')).toBe(false)
+  })
+  it('stays quiet on a busy pane that merely echoes the title', () => {
     const pane = HELD_PEER_PANE + '\n✻ Worked for 3s\n  esc to interrupt'
     expect(detectsHeldPeerMessage(pane)).toBe(false)
   })
-  it('stays quiet when the idle footer is live (the phrase is quoted text)', () => {
-    const pane = '  "A message from another session needs your approval" was the line I saw.\n\n❯ \n  ? for shortcuts'
+  it('stays quiet when the idle footer is live (the title is quoted text)', () => {
+    const pane = '  "Held message from another session" was the title I saw.\n\n❯ \n  ? for shortcuts'
     expect(detectsHeldPeerMessage(pane)).toBe(false)
   })
   it('stays quiet on an empty or idle pane', () => {
     expect(detectsHeldPeerMessage('')).toBe(false)
     expect(detectsHeldPeerMessage(IDLE_PANE)).toBe(false)
+  })
+})
+
+describe('the menu pass never Escapes a held peer message (#1596 review point 4)', () => {
+  it('detectsBlockingMenu is false on the held-peer dialog', () => {
+    expect(detectsBlockingMenu(HELD_PEER_PANE)).toBe(false)
+  })
+  it('...and it is the held-peer guard that makes the difference: the same modal without the title is a menu', () => {
+    const genericModal = HELD_PEER_PANE.replace(' Held message from another session', ' Select an option')
+    expect(detectsBlockingMenu(genericModal)).toBe(true)
   })
 })
 
@@ -99,26 +124,23 @@ describe('alert texts', () => {
     expect(p).toContain('másik sessionből')
     expect(p).toContain('tmux attach -t agent-cella')
   })
-  it('a stuck counter says it was NOT restarted', () => {
-    const st: StuckToolCallState = { tag: 'worked', spellStartSeconds: 31, spellPeakSeconds: 31, firstSeenAt: 1, lastSeconds: 31, stagnantPolls: 7, stagnantSince: 1, attempts: 1 }
-    const t = formatAgentStuckAlert('konnektor', 'agent-konnektor', st, { freezeSeconds: 180, stagnantPolls: 2, minPeakSeconds: 20 })
-    expect(t).toContain('konnektor')
-    expect(t).toContain('31s')
-    expect(t).toContain('NEM indítottam újra')
-  })
 })
 
 type Alert = { agent: string; kind: string; waitingMs?: number; ask?: unknown }
 
-function makeDeps(panes: Record<string, () => string | null>, clock: { now: number }, running: (a: string) => boolean = () => true) {
+function makeDeps(
+  panes: Record<string, () => string | null>,
+  clock: { now: number },
+  opts: { running?: (a: string) => boolean; channel?: (a: string) => boolean } = {},
+) {
   const alerts: Alert[] = []
   const deps: SubAgentSweepDeps = {
     listAgents: () => Object.keys(panes),
-    isRunning: running,
+    isRunning: opts.running ?? (() => true),
+    hasChannel: opts.channel ?? (() => false),
     capture: (agent) => panes[agent]?.() ?? null,
     now: () => clock.now,
     alertWait: (agent, _session, kind, waitingMs, ask) => { alerts.push({ agent, kind, waitingMs, ask }) },
-    alertStuck: (agent) => { alerts.push({ agent, kind: 'stuck' }) },
   }
   return { deps, alerts }
 }
@@ -138,6 +160,19 @@ describe('sweepSubAgents', () => {
     expect(alerts[0]).toMatchObject({ agent: 'kigyo', kind: 'permission' })
     expect(alerts[0].waitingMs).toBe(3.5 * MIN)
     expect((alerts[0].ask as { title: string }).title).toMatch(/Bash command/)
+  })
+
+  it('one owner per state: no permission alert for a channel-owning agent, the held peer message still alerts', () => {
+    // review point 1: the channel-monitor's menu pass already reports a
+    // permission prompt on an agent with a channel.
+    const clock = { now: 1_000_000 }
+    const { deps, alerts } = makeDeps(
+      { cella: () => PERMISSION_PANE, kigyo: () => PERMISSION_PANE, konnektor: () => HELD_PEER_PANE },
+      clock,
+      { channel: (a) => a !== 'kigyo' },
+    )
+    for (let i = 0; i < 3; i++) { clock.now += 2 * MIN; sweepSubAgents(deps) }
+    expect(alerts.map((a) => `${a.agent}:${a.kind}`).sort()).toEqual(['kigyo:permission', 'konnektor:peer-message'])
   })
 
   it('does not repeat inside the dedup window, repeats after it while still waiting, clears when answered', () => {
@@ -173,7 +208,11 @@ describe('sweepSubAgents', () => {
 
   it('skips the main agent and agents that are not running', () => {
     const clock = { now: 1_000_000 }
-    const { deps, alerts } = makeDeps({ [MAIN_AGENT_ID]: () => PERMISSION_PANE, cella: () => PERMISSION_PANE, konnektor: () => PERMISSION_PANE }, clock, (a) => a !== 'konnektor')
+    const { deps, alerts } = makeDeps(
+      { [MAIN_AGENT_ID]: () => PERMISSION_PANE, cella: () => PERMISSION_PANE, konnektor: () => PERMISSION_PANE },
+      clock,
+      { running: (a) => a !== 'konnektor' },
+    )
     for (let i = 0; i < 4; i++) { clock.now += 2 * MIN; sweepSubAgents(deps) }
     expect(alerts.map((a) => a.agent)).toEqual(['cella'])
   })
@@ -185,27 +224,12 @@ describe('sweepSubAgents', () => {
     expect(alerts.map((a) => a.agent)).toEqual(['kigyo'])
   })
 
-  it('reports a stagnant tool-call counter once per spell and never for an idle residual', () => {
+  it('a long busy turn (even with a frozen-looking summary line) never alerts: no counter watch on sub-agents', () => {
+    // review point 2: "Worked for 31s" above "esc to interrupt" is a working
+    // session with a residual summary, not a wedge.
     const clock = { now: 1_000_000 }
-    let pane: string | null = busyPane(31)
-    const { deps, alerts } = makeDeps({ ketely: () => pane }, clock)
-    // Same cadence as the main-path contract: 30s polls, 180s of stagnation.
-    for (let i = 0; i < 8; i++) { sweepSubAgents(deps); clock.now += 30_000 }
-    expect(alerts).toEqual([{ agent: 'ketely', kind: 'stuck' }])
-    for (let i = 0; i < 4; i++) { sweepSubAgents(deps); clock.now += 30_000 }
-    expect(alerts).toHaveLength(1)               // one report per spell
-    // A residual footer above a live idle prompt is a completed turn, not a wedge.
-    resetSubAgentWatchState()
-    pane = busyPane(31).replace('  esc to interrupt', '❯ \n  ? for shortcuts')
-    for (let i = 0; i < 10; i++) { sweepSubAgents(deps); clock.now += 30_000 }
-    expect(alerts).toHaveLength(1)
-  })
-
-  it('a progressing counter never alerts', () => {
-    const clock = { now: 1_000_000 }
-    let s = 20
-    const { deps, alerts } = makeDeps({ kigyo: () => busyPane(s) }, clock)
-    for (let i = 0; i < 12; i++) { sweepSubAgents(deps); clock.now += 30_000; s += 30 }
+    const { deps, alerts } = makeDeps({ ketely: () => busyPane(31) }, clock)
+    for (let i = 0; i < 20; i++) { sweepSubAgents(deps); clock.now += 30_000 }
     expect(alerts).toEqual([])
   })
 })
