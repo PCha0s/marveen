@@ -851,11 +851,17 @@ export function parseAgentStateFile(text: string): AgentStateReading | null {
 // awaiting_approval does, and not over a busy pane: an APPROVED tool's own run
 // still reads awaiting_approval (the mod's known limit) and shows the busy
 // markers, which an open dialog hides (the captured permission cards read
-// 'unknown', never 'busy').
+// 'unknown', never 'busy'). Not over an idle pane either: a dialog replaces the
+// input box, so an idle prompt cannot sit under one, and a reading kept past
+// the dialog (a deny path ending without tool.call or turn.complete) must not
+// alert over it every 30 minutes.
 export function stateFileSaysWaiting(reading: AgentStateReading | null, pane: string | null, now: number): boolean {
   if (!reading || reading.state !== 'awaiting_approval') return false
   if (now - reading.aliveAt >= AGENT_STATE_STALE_MS) return false
-  if (pane != null && detectPaneState(pane) === 'busy') return false
+  if (pane != null) {
+    const paneState = detectPaneState(pane)
+    if (paneState === 'busy' || paneState === 'idle') return false
+  }
   return true
 }
 

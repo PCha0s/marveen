@@ -13,7 +13,7 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { detectsHeldPeerMessage, detectsPermissionDialog, detectsBlockingMenu } from '../pane-state.js'
+import { detectsHeldPeerMessage, detectsPermissionDialog, detectsBlockingMenu, detectPaneState } from '../pane-state.js'
 import {
   classifyAgentWait,
   sweepSubAgents,
@@ -287,6 +287,10 @@ describe('stateFileSaysWaiting', () => {
   })
   it('a busy pane is the approved tool running (the mod\'s known limit), not a wait', () => {
     expect(stateFileSaysWaiting(fresh(), busyPane(40), NOW)).toBe(false)
+  })
+  it('an idle prompt cannot sit under an open dialog, so a reading kept past it is not a wait', () => {
+    expect(detectPaneState(IDLE_PANE)).toBe('idle')
+    expect(stateFileSaysWaiting(fresh(), IDLE_PANE, NOW)).toBe(false)
   })
   it('a stale file, another state or no file says nothing', () => {
     expect(stateFileSaysWaiting({ ...fresh(), aliveAt: NOW - AGENT_STATE_STALE_MS }, UNKNOWN_DIALOG_PANE, NOW)).toBe(false)
