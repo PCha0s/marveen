@@ -47,6 +47,12 @@
 //     channel-owning agent the channel-monitor's menu pass already alerts the
 //     owner on that prompt (45 s confirm, 5 min dedup), so alerting here too
 //     sent two messages for one prompt (#1596 review, point 1).
+// A second signal for the tool-permission wait (STATEOBS1012): the
+// agent-state-observer file (<store>/mod-state/<agent>.json). The mod writes
+// awaiting_approval when a dialog opens, including the one a hook's `ask` opens
+// with no PermissionRequest, whose card the pane matcher may not know. It can
+// only ADD a 'permission' wait the pane did not show, and the one-owner rule
+// above applies to it unchanged.
 // A waiting prompt is a QUESTION, not a wedge: the alert says who is waiting
 // and what it asks, and never sends a keystroke (Escape would answer "no").
 // A stagnant tool-call counter on a sub-agent is deliberately NOT watched here:
@@ -65,6 +71,7 @@ import { PROJECT_ROOT, STORE_DIR } from '../config.js'
 import { capturePane, isAgentRunning, agentSessionName, agentHasChannel } from './agent-process.js'
 import { listAgentNames, readAgentRemoteHost } from './agent-config.js'
 import { readTranscriptMtimeAcrossConfigDirs } from './active-model.js'
+import { STATE_OBSERVER_STATE_DIR } from './state-observer.js'
 import { mainConfigRoots } from './inbound-probe.js'
 import { MAIN_CHANNELS_SESSION, withoutMainAgent } from './main-agent.js'
 import { resumeMarveenSession, sendAlert, lastMainRespawnAt, MARVEEN_POST_RESPAWN_GRACE_MS } from './channel-monitor.js'
@@ -556,6 +563,62 @@ export function formatAgentWaitAlert(
   return `⏸️ A(z) ${agent} ágens ${min} perce egy tool-engedélykérésre vár.${what} Nem hiba: a session él, egy igen/nem kérdés áll a bemenet előtt, és azt csak ember válaszolhatja meg. Nem nyomtam meg semmit (az Escape ott NEM-et jelentene). Döntsd el: tmux attach -t ${session}`
 }
 
+// ---- the agent-state-observer file as a second signal (STATEOBS1012) --------
+
+export interface AgentStateReading {
+  state: string
+  /** The tool the open dialog asks about; null when absent or not a plain word. */
+  tool: string | null
+  /** Epoch ms the session last proved alive (the mod refreshes it every minute). */
+  aliveAt: number
+}
+
+/** A state file older than this says nothing: its session is gone or frozen. */
+export const AGENT_STATE_STALE_MS = 5 * 60 * 1000
+
+// The state and the tool name reach an owner alert: only a plain word passes.
+const PLAIN_WORD_RX = /^[A-Za-z0-9_.:-]{1,80}$/
+
+// Pure: the fields this watcher reads, or null for anything that is not a
+// well-formed state file.
+export function parseAgentStateFile(text: string): AgentStateReading | null {
+  let s: unknown
+  try {
+    s = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (!s || typeof s !== 'object') return null
+  const o = s as Record<string, unknown>
+  if (typeof o.state !== 'string' || !PLAIN_WORD_RX.test(o.state)) return null
+  if (typeof o.alive_at !== 'number' || !Number.isFinite(o.alive_at)) return null
+  const tool = typeof o.tool === 'string' && PLAIN_WORD_RX.test(o.tool) ? o.tool : null
+  return { state: o.state, tool, aliveAt: o.alive_at }
+}
+
+// Pure: does the state file add a 'permission' wait? Only a fresh
+// awaiting_approval does, and not over a busy pane: an APPROVED tool's own run
+// still reads awaiting_approval (the mod's known limit) and shows the busy
+// markers, which an open dialog hides (the captured permission cards read
+// 'unknown', never 'busy').
+export function stateFileSaysWaiting(reading: AgentStateReading | null, pane: string | null, now: number): boolean {
+  if (!reading || reading.state !== 'awaiting_approval') return false
+  if (now - reading.aliveAt >= AGENT_STATE_STALE_MS) return false
+  if (pane != null && detectPaneState(pane) === 'busy') return false
+  return true
+}
+
+// The live reader: a local agent's file only (the mod never loads into a
+// remote agent, so a local file under its name would be a stale leftover).
+function readLocalAgentState(agent: string): AgentStateReading | null {
+  if (!/^[a-z0-9_-]+$/i.test(agent) || readAgentRemoteHost(agent)) return null
+  try {
+    return parseAgentStateFile(readFileSync(join(STATE_OBSERVER_STATE_DIR, `${agent}.json`), 'utf-8'))
+  } catch {
+    return null
+  }
+}
+
 export interface SubAgentSweepDeps {
   listAgents: () => string[]
   isRunning: (agent: string) => boolean
@@ -564,6 +627,8 @@ export interface SubAgentSweepDeps {
   capture: (agent: string, session: string) => string | null
   now: () => number
   alertWait: (agent: string, session: string, kind: AgentWaitKind, waitingMs: number, ask: PermissionPromptSummary | null) => void
+  /** The agent's agent-state-observer reading (second signal); absent = pane only. */
+  readState?: (agent: string) => AgentStateReading | null
   waitThresholds?: PaneErrorAlertThresholds
 }
 
@@ -599,13 +664,20 @@ export function sweepSubAgents(deps: SubAgentSweepDeps): void {
       // permission prompt on a channel-owning agent is the channel-monitor's
       // (one owner per state, #1596 review point 1).
       let kind = classifyAgentWait(pane)
+      // The state file only adds a wait the pane did not show (STATEOBS1012).
+      const reading = kind == null && deps.readState ? deps.readState(agent) : null
+      if (kind == null && stateFileSaysWaiting(reading, pane, now)) kind = 'permission'
       if (kind === 'permission' && deps.hasChannel(agent)) kind = null
       const prevWait = agentWaitState.get(agent) ?? { firstSeenAt: null, lastAlertAt: null, lastErrorAt: null }
       const wait = decidePaneErrorAlert(kind != null, prevWait, now, waitThresholds)
       if (wait.next.firstSeenAt === null) agentWaitState.delete(agent)
       else agentWaitState.set(agent, wait.next)
       if (wait.alert && kind != null) {
-        const ask = kind === 'permission' && pane != null ? permissionPromptSummary(pane) : null
+        // What it asks: the card on the pane, else the tool the state file names.
+        const ask = kind !== 'permission'
+          ? null
+          : (pane != null ? permissionPromptSummary(pane) : null)
+            ?? (reading ? { title: reading.tool ?? 'ismeretlen eszköz', reason: 'az állapotfigyelő szerint jóváhagyásra vár' } : null)
         logger.warn({ agent, session, kind, waitingMs: now - (wait.next.firstSeenAt ?? now) }, 'stuck-tool-call-watcher: sub-agent is waiting on a person (no keystrokes sent) -- alerting')
         deps.alertWait(agent, session, kind, now - (wait.next.firstSeenAt ?? now), ask)
       }
@@ -628,6 +700,7 @@ const LIVE_SUB_AGENT_DEPS: SubAgentSweepDeps = {
   alertWait: (agent, session, kind, waitingMs, ask) => {
     sendRoutineAlert(`agent-wait:${agent}`, formatAgentWaitAlert(agent, session, kind, waitingMs, ask))
   },
+  readState: readLocalAgentState,
 }
 
 export function startStuckToolCallWatcher(): NodeJS.Timeout {

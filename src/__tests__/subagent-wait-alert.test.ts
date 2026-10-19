@@ -20,7 +20,11 @@ import {
   resetSubAgentWatchState,
   formatAgentWaitAlert,
   AGENT_WAIT_THRESHOLDS,
+  parseAgentStateFile,
+  stateFileSaysWaiting,
+  AGENT_STATE_STALE_MS,
   type SubAgentSweepDeps,
+  type AgentStateReading,
 } from '../web/stuck-tool-call-watcher.js'
 import { MAIN_AGENT_ID } from '../config.js'
 
@@ -131,7 +135,7 @@ type Alert = { agent: string; kind: string; waitingMs?: number; ask?: unknown }
 function makeDeps(
   panes: Record<string, () => string | null>,
   clock: { now: number },
-  opts: { running?: (a: string) => boolean; channel?: (a: string) => boolean } = {},
+  opts: { running?: (a: string) => boolean; channel?: (a: string) => boolean; state?: (a: string) => AgentStateReading | null } = {},
 ) {
   const alerts: Alert[] = []
   const deps: SubAgentSweepDeps = {
@@ -141,6 +145,7 @@ function makeDeps(
     capture: (agent) => panes[agent]?.() ?? null,
     now: () => clock.now,
     alertWait: (agent, _session, kind, waitingMs, ask) => { alerts.push({ agent, kind, waitingMs, ask }) },
+    ...(opts.state ? { readState: opts.state } : {}),
   }
   return { deps, alerts }
 }
@@ -231,5 +236,138 @@ describe('sweepSubAgents', () => {
     const { deps, alerts } = makeDeps({ ketely: () => busyPane(31) }, clock)
     for (let i = 0; i < 20; i++) { sweepSubAgents(deps); clock.now += 30_000 }
     expect(alerts).toEqual([])
+  })
+})
+
+// STATEOBS1012: the agent-state-observer file as a second signal for the
+// tool-permission wait. It adds a wait the pane did not show (a hook's `ask`
+// opens a dialog with no PermissionRequest, whose card the matcher may not
+// know), never over a busy pane, never from a stale file, and the one-owner
+// rule applies to it unchanged.
+
+// A dialog the pane matcher does not know: no idle footer, no busy marker, no
+// "Do you want to proceed?".
+const UNKNOWN_DIALOG_PANE = [
+  '  Checking the branch.',
+  '',
+  ' Some future approval card',
+  '',
+  ' ❯ 1. Allow',
+  '   2. Deny',
+  '',
+  ' Enter to confirm · Esc to cancel',
+].join('\n')
+
+describe('parseAgentStateFile', () => {
+  it('reads the state, the tool and alive_at of a well-formed file', () => {
+    expect(parseAgentStateFile('{"v":1,"state":"awaiting_approval","tool":"Bash","alive_at":1792407339999}'))
+      .toEqual({ state: 'awaiting_approval', tool: 'Bash', aliveAt: 1792407339999 })
+  })
+  it('a tool name that is not a plain word is dropped (it reaches an owner alert)', () => {
+    expect(parseAgentStateFile('{"state":"awaiting_approval","tool":"Bash; rm -rf /","alive_at":1}')?.tool).toBeNull()
+    expect(parseAgentStateFile('{"state":"awaiting_approval","tool":null,"alive_at":1}')?.tool).toBeNull()
+  })
+  it('anything else is no reading at all', () => {
+    expect(parseAgentStateFile('{"state":')).toBeNull()
+    expect(parseAgentStateFile('null')).toBeNull()
+    expect(parseAgentStateFile('{"state":"awaiting approval!","alive_at":1}')).toBeNull()
+    expect(parseAgentStateFile('{"state":"awaiting_approval"}')).toBeNull()
+    expect(parseAgentStateFile('{"state":"awaiting_approval","alive_at":"1"}')).toBeNull()
+  })
+})
+
+describe('stateFileSaysWaiting', () => {
+  const NOW = 2_000_000_000_000
+  const fresh = (state = 'awaiting_approval'): AgentStateReading => ({ state, tool: 'Bash', aliveAt: NOW - 30_000 })
+  it('a fresh awaiting_approval over a pane that is not busy is a wait', () => {
+    expect(stateFileSaysWaiting(fresh(), UNKNOWN_DIALOG_PANE, NOW)).toBe(true)
+    // the captured permission card reads 'unknown', never 'busy'
+    expect(stateFileSaysWaiting(fresh(), PERMISSION_PANE, NOW)).toBe(true)
+    expect(stateFileSaysWaiting(fresh(), null, NOW)).toBe(true)
+  })
+  it('a busy pane is the approved tool running (the mod\'s known limit), not a wait', () => {
+    expect(stateFileSaysWaiting(fresh(), busyPane(40), NOW)).toBe(false)
+  })
+  it('a stale file, another state or no file says nothing', () => {
+    expect(stateFileSaysWaiting({ ...fresh(), aliveAt: NOW - AGENT_STATE_STALE_MS }, UNKNOWN_DIALOG_PANE, NOW)).toBe(false)
+    expect(stateFileSaysWaiting(fresh('working'), UNKNOWN_DIALOG_PANE, NOW)).toBe(false)
+    expect(stateFileSaysWaiting(null, UNKNOWN_DIALOG_PANE, NOW)).toBe(false)
+  })
+})
+
+describe('sweepSubAgents with the state file (STATEOBS1012)', () => {
+  beforeEach(() => resetSubAgentWatchState())
+  const MIN = 60_000
+  const waitingFile = (clock: { now: number }, tool: string | null = 'Bash') => () => ({ state: 'awaiting_approval', tool, aliveAt: clock.now - 20_000 })
+
+  it('adds the wait the pane did not show, after the same confirm window, naming the tool', () => {
+    const clock = { now: 1_000_000 }
+    const { deps, alerts } = makeDeps({ cella: () => UNKNOWN_DIALOG_PANE }, clock, { state: waitingFile(clock) })
+    sweepSubAgents(deps)
+    clock.now += 1 * MIN; sweepSubAgents(deps)
+    expect(alerts).toEqual([])
+    clock.now += 2.5 * MIN; sweepSubAgents(deps)
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0]).toMatchObject({ agent: 'cella', kind: 'permission', waitingMs: 3.5 * MIN })
+    expect(alerts[0].ask).toEqual({ title: 'Bash', reason: 'az állapotfigyelő szerint jóváhagyásra vár' })
+  })
+
+  it('without the state reader the same pane alerts nothing (the pane alone does not know that card)', () => {
+    const clock = { now: 1_000_000 }
+    const { deps, alerts } = makeDeps({ cella: () => UNKNOWN_DIALOG_PANE }, clock)
+    for (let i = 0; i < 4; i++) { clock.now += 2 * MIN; sweepSubAgents(deps) }
+    expect(alerts).toEqual([])
+  })
+
+  it('one owner per state: a channel-owning agent\'s state-file wait stays the channel-monitor\'s', () => {
+    const clock = { now: 1_000_000 }
+    const { deps, alerts } = makeDeps({ kigyo: () => UNKNOWN_DIALOG_PANE }, clock, { state: waitingFile(clock), channel: () => true })
+    for (let i = 0; i < 4; i++) { clock.now += 2 * MIN; sweepSubAgents(deps) }
+    expect(alerts).toEqual([])
+  })
+
+  it('an approved tool still running (busy pane) never alerts', () => {
+    const clock = { now: 1_000_000 }
+    const { deps, alerts } = makeDeps({ cella: () => busyPane(90) }, clock, { state: waitingFile(clock) })
+    for (let i = 0; i < 4; i++) { clock.now += 2 * MIN; sweepSubAgents(deps) }
+    expect(alerts).toEqual([])
+  })
+
+  it('a stale file (session gone or frozen) never alerts', () => {
+    const clock = { now: 1_000_000 }
+    const stale = () => ({ state: 'awaiting_approval', tool: 'Bash', aliveAt: clock.now - AGENT_STATE_STALE_MS - 1 })
+    const { deps, alerts } = makeDeps({ cella: () => UNKNOWN_DIALOG_PANE }, clock, { state: stale })
+    for (let i = 0; i < 4; i++) { clock.now += 2 * MIN; sweepSubAgents(deps) }
+    expect(alerts).toEqual([])
+  })
+
+  it('when the pane shows the card itself, the pane\'s question is quoted and the file is not read', () => {
+    const clock = { now: 1_000_000 }
+    let reads = 0
+    const { deps, alerts } = makeDeps({ cella: () => PERMISSION_PANE }, clock, { state: () => { reads++; return waitingFile(clock, 'Edit')() } })
+    for (let i = 0; i < 3; i++) { clock.now += 2 * MIN; sweepSubAgents(deps) }
+    expect(alerts).toHaveLength(1)
+    expect((alerts[0].ask as { title: string }).title).toMatch(/Bash command/)
+    expect(reads).toBe(0)
+  })
+
+  it('a file with no plain-word tool still alerts, without inventing a name', () => {
+    const clock = { now: 1_000_000 }
+    const { deps, alerts } = makeDeps({ cella: () => UNKNOWN_DIALOG_PANE }, clock, { state: waitingFile(clock, null) })
+    for (let i = 0; i < 3; i++) { clock.now += 2 * MIN; sweepSubAgents(deps) }
+    expect(alerts).toHaveLength(1)
+    expect(alerts[0].ask).toEqual({ title: 'ismeretlen eszköz', reason: 'az állapotfigyelő szerint jóváhagyásra vár' })
+  })
+})
+
+describe('the live wiring reads the state file (STATEOBS1012)', () => {
+  const SRC = readFileSync(join(__dirname, '../web/stuck-tool-call-watcher.ts'), 'utf-8')
+  it('passes the local reader into the live sweep, from the observer\'s own state folder', () => {
+    const live = SRC.slice(SRC.indexOf('const LIVE_SUB_AGENT_DEPS'))
+    expect(live.slice(0, 900)).toMatch(/readState: readLocalAgentState/)
+    expect(SRC).toMatch(/join\(STATE_OBSERVER_STATE_DIR, `\$\{agent\}\.json`\)/)
+    // a remote agent's name never reaches a local file
+    const reader = SRC.slice(SRC.indexOf('function readLocalAgentState'))
+    expect(reader.slice(0, 400)).toMatch(/readAgentRemoteHost\(agent\)\) return null/)
   })
 })
