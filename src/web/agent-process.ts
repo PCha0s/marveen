@@ -31,6 +31,7 @@ import {
   mcpTrustAcceptKeys,
   devChannelsAcceptKeys,
   detectsBlockingMenu,
+  detectsHeldPeerMessage,
   type FirstRunGateKind,
 } from '../pane-state.js'
 import { scheduleRecoveryBrief } from './restart-recovery-brief.js'
@@ -3391,10 +3392,13 @@ export async function settleStartupGates(
 // The identity /rename is text followed by Enter. Typed into a dialog, the
 // text is dropped and the Enter CONFIRMS the highlighted option -- which is
 // how it used to answer the development-channels warning by accident (see
-// above). Never into a first-run gate or a blocking menu.
+// above). Never into a first-run gate, a blocking menu or a held peer
+// message: detectsBlockingMenu leaves the held-peer dialog out (so the menu
+// pass never Escapes it), and on that dialog the Enter would confirm the
+// highlighted "Deliver this message to Claude" on the user's behalf.
 export function paneRefusesIdentityCommand(pane: string | null): boolean {
   if (pane == null) return true
-  return detectsFirstRunGate(pane) != null || detectsBlockingMenu(pane)
+  return detectsFirstRunGate(pane) != null || detectsBlockingMenu(pane) || detectsHeldPeerMessage(pane)
 }
 
 // How many times the identity send retries when the pane's send lane is held

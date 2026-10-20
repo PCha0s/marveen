@@ -688,6 +688,10 @@ export function detectsBlockingMenu(pane: string): boolean {
   // and tell the sender so (the dialog's Deny: "drop it and tell the sender it
   // was declined"). Never treat it as a menu to pop; the sub-agent sweep
   // (stuck-tool-call-watcher.ts) alerts the owner instead (#1596 review).
+  // It is still a dialog for anything that TYPES: a caller that uses this
+  // function to refuse text + Enter must check detectsHeldPeerMessage too
+  // (urgentEmitRefusal, paneRefusesIdentityCommand), since that Enter would
+  // confirm the highlighted "Deliver this message to Claude".
   if (detectsHeldPeerMessage(pane)) return false
   return MENU_NAV_RX.test(footerRegion) || MENU_ESC_RX.test(footerRegion)
 }

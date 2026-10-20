@@ -36,7 +36,7 @@ import {
   capturePane,
   clearFeedbackModalAndRecheck,
 } from './agent-process.js'
-import { detectPaneState, detectQuotaWall, detectsBlockingMenu, detectsFirstRunGate, detectsPermissionDialog, permissionPromptSummary, type FirstRunGateKind, type PaneState, type PermissionPromptSummary, type QuotaWall } from '../pane-state.js'
+import { detectPaneState, detectQuotaWall, detectsBlockingMenu, detectsFirstRunGate, detectsHeldPeerMessage, detectsPermissionDialog, permissionPromptSummary, type FirstRunGateKind, type PaneState, type PermissionPromptSummary, type QuotaWall } from '../pane-state.js'
 import { setLastInboundModality } from './voice-modality.js'
 import { classifyAgentMessage, isChannelInboundSender, wrapAgentMessageForDelivery } from './agent-message-wrap.js'
 import { composeBatchInjection, batchInjectCapFor } from './batch-inject.js'
@@ -431,14 +431,18 @@ export function detectUrgentPaneHold(pane: string | null): UrgentPaneHold | null
 /**
  * Pure: the last look at the pane inside the send lane, right before the first key
  * (sendPromptToSession's emitGuard). Stricter than detectUrgentPaneHold: any blocking
- * menu, and a pane that cannot be read, refuse too -- here no later step could undo an
- * Enter that landed in the wrong place. null = type.
+ * menu, a held peer message, and a pane that cannot be read, refuse too -- here no
+ * later step could undo an Enter that landed in the wrong place. The held peer message
+ * is checked on its own because detectsBlockingMenu leaves it out (the menu pass must
+ * not Escape it), and its Enter would deliver the held message on the user's behalf.
+ * null = type.
  */
 export function urgentEmitRefusal(pane: string | null): string | null {
   if (pane == null || !pane.trim()) return 'pane unreadable'
   const hold = detectUrgentPaneHold(pane)
   if (hold) return hold.kind
   if (detectsBlockingMenu(pane)) return 'blocking-menu'
+  if (detectsHeldPeerMessage(pane)) return 'held-peer-message'
   return null
 }
 

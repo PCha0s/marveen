@@ -3,8 +3,9 @@
 // session held a cross-session message for approval for hours; no watcher
 // recognised that dialog, so nothing alerted. These tests pin the detector for
 // that dialog (anchored on its title), the classification, the menu pass never
-// Escaping it, and the alert-only sweep (confirm window, dedup, clearing, one
-// owner per state, never a keystroke).
+// Escaping it while every typing guard still refuses it, and the alert-only
+// sweep (confirm window, dedup, clearing, one owner per state, never a
+// keystroke).
 //
 // #1596 review: the stagnant-counter half is not part of this change (it needs
 // a per-agent transcript-mtime guard first), and a permission prompt on a
@@ -26,6 +27,8 @@ import {
   type SubAgentSweepDeps,
   type AgentStateReading,
 } from '../web/stuck-tool-call-watcher.js'
+import { urgentEmitRefusal } from '../web/message-router.js'
+import { paneRefusesIdentityCommand } from '../web/agent-process.js'
 import { MAIN_AGENT_ID } from '../config.js'
 
 const load = (n: string) => readFileSync(join(__dirname, `fixtures/pane/${n}.txt`), 'utf8')
@@ -103,6 +106,23 @@ describe('the menu pass never Escapes a held peer message (#1596 review point 4)
   it('...and it is the held-peer guard that makes the difference: the same modal without the title is a menu', () => {
     const genericModal = HELD_PEER_PANE.replace(' Held message from another session', ' Select an option')
     expect(detectsBlockingMenu(genericModal)).toBe(true)
+  })
+})
+
+describe('a held peer message is still a dialog for every typing guard', () => {
+  // detectsBlockingMenu leaves the held-peer dialog out so the menu pass never
+  // Escapes it. The guards that refuse text + Enter used detectsBlockingMenu for
+  // it too, and must not lose it with that: on this dialog the Enter confirms
+  // the highlighted "Deliver this message to Claude" on the user's behalf.
+  it('the STOP / urgent emit guard refuses it', () => {
+    expect(urgentEmitRefusal(HELD_PEER_PANE)).toBe('held-peer-message')
+  })
+  it('the identity /rename refuses it', () => {
+    expect(paneRefusesIdentityCommand(HELD_PEER_PANE)).toBe(true)
+  })
+  it('neither guard refuses an idle prompt', () => {
+    expect(urgentEmitRefusal(IDLE_PANE)).toBeNull()
+    expect(paneRefusesIdentityCommand(IDLE_PANE)).toBe(false)
   })
 })
 
