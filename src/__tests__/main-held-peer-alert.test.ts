@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const h = vi.hoisted(() => ({
   pane: '',
+  captured: [] as string[],          // every session capturePane was asked for
   exec: [] as string[][],
   routine: vi.fn(),
   alert: vi.fn(),
@@ -26,7 +27,7 @@ vi.mock('node:child_process', () => ({
 vi.mock('../logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }))
 vi.mock('../platform.js', () => ({ resolveFromPath: () => '/usr/bin/tmux' }))
 vi.mock('../config.js', () => ({ PROJECT_ROOT: '/nonexistent-project-root', STORE_DIR: '/nonexistent-store-dir', BOT_NAME: 'Marveen', MAIN_AGENT_ID: 'marveen' }))
-vi.mock('../web/agent-process.js', () => ({ capturePane: () => h.pane, isAgentRunning: () => false, agentSessionName: (a: string) => a, agentHasChannel: () => true }))
+vi.mock('../web/agent-process.js', () => ({ capturePane: (session: string) => { h.captured.push(session); return h.pane }, isAgentRunning: () => false, agentSessionName: (a: string) => a, agentHasChannel: () => true }))
 vi.mock('../web/agent-config.js', () => ({ listAgentNames: () => [], readAgentRemoteHost: () => null }))
 vi.mock('../web/state-observer.js', () => ({ STATE_OBSERVER_STATE_DIR: '/nonexistent-state-dir' }))
 vi.mock('../web/active-model.js', () => ({ readTranscriptMtimeAcrossConfigDirs: () => null }))
@@ -82,6 +83,7 @@ beforeEach(async () => {
   startWatcher = (await import('../web/stuck-tool-call-watcher.js')).startStuckToolCallWatcher
   vi.useFakeTimers()
   h.pane = HELD_PEER_PANE
+  h.captured.length = 0
   h.exec.length = 0
   h.routine.mockClear()
   h.alert.mockClear()
@@ -101,6 +103,9 @@ describe('the main session holding a peer message', () => {
     expect(text).toContain('tmux attach -t main-test')
     expect(h.alert).not.toHaveBeenCalled()
     expect(sentKeys()).toEqual([])
+    // The pane read is the main channels session's: with any other session the
+    // alert would go silent while the canned pane kept this test green (#2079 review, K7).
+    expect([...new Set(h.captured)]).toEqual(['main-test'])
   })
 
   it('says it again only after the dedup window while the dialog still stands', async () => {
